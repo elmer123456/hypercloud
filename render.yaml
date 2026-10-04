@@ -8,15 +8,15 @@ envVarGroups:
 services:
   - type: keyvalue
     name: drime-multi-vault-redis
-    plan: starter
+    plan: free
+    maxmemoryPolicy: noeviction
     ipAllowList: []
   - type: web
     name: drime-multi-vault-api
     runtime: node
-    plan: starter
+    plan: free
     buildCommand: bash bootstrap.sh && npm ci && npm run prisma:generate -w backend && npm run build -w backend
-    preDeployCommand: npm run prisma:deploy -w backend
-    startCommand: npm start -w backend
+    startCommand: bash -c "npm run prisma:deploy -w backend && (npm run worker:start -w backend &) && (while true; do sleep 21600; npm run schedule -w backend; done &) && npm start -w backend"
     healthCheckPath: /health
     envVars:
       - fromGroup: drime-multi-vault-secrets
@@ -37,54 +37,6 @@ services:
         value: https://app.drime.cloud/api/v1
       - key: FRONTEND_URL
         value: https://drime-multi-vault-web.onrender.com
-  - type: worker
-    name: drime-multi-vault-worker
-    runtime: node
-    plan: starter
-    buildCommand: bash bootstrap.sh && npm ci && npm run prisma:generate -w backend && npm run build -w backend
-    startCommand: npm run worker:start -w backend
-    envVars:
-      - fromGroup: drime-multi-vault-secrets
-      - key: NODE_VERSION
-        value: 20.18.0
-      - key: NODE_ENV
-        value: production
-      - key: DATABASE_URL
-        fromDatabase:
-          name: drime-multi-vault-db
-          property: connectionString
-      - key: REDIS_URL
-        fromService:
-          type: keyvalue
-          name: drime-multi-vault-redis
-          property: connectionString
-      - key: DRIME_API_BASE_URL
-        value: https://app.drime.cloud/api/v1
-      - key: FRONTEND_URL
-        value: https://drime-multi-vault-web.onrender.com
-  - type: cron
-    name: drime-multi-vault-scheduler
-    runtime: node
-    plan: starter
-    schedule: "0 */6 * * *"
-    buildCommand: bash bootstrap.sh && npm ci && npm run build -w backend
-    startCommand: npm run schedule -w backend
-    envVars:
-      - key: NODE_VERSION
-        value: 20.18.0
-      - key: DATABASE_URL
-        fromDatabase:
-          name: drime-multi-vault-db
-          property: connectionString
-      - key: REDIS_URL
-        fromService:
-          type: keyvalue
-          name: drime-multi-vault-redis
-          property: connectionString
-      - key: JWT_SECRET
-        value: cron-not-used-but-config-required-123456
-      - key: TOKEN_ENCRYPTION_KEY
-        value: cron-not-used-but-config-required-123456
   - type: web
     name: drime-multi-vault-web
     runtime: static
@@ -101,6 +53,6 @@ services:
         destination: /index.html
 databases:
   - name: drime-multi-vault-db
-    plan: basic-256mb
+    plan: free
     databaseName: drime_vault
     user: drime_vault
