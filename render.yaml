@@ -15,7 +15,7 @@ services:
     name: drime-multi-vault-api
     runtime: node
     plan: free
-    buildCommand: bash bootstrap.sh && npm ci && npm run prisma:generate -w backend && npm run build -w backend
+    buildCommand: bash bootstrap.sh && npm ci --include=dev && npm run prisma:generate -w backend && npm run build -w backend
     startCommand: bash -c "npm run prisma:deploy -w backend && (npm run worker:start -w backend &) && (while true; do sleep 21600; npm run schedule -w backend; done &) && npm start -w backend"
     healthCheckPath: /health
     envVars:
@@ -40,7 +40,7 @@ services:
   - type: web
     name: drime-multi-vault-web
     runtime: static
-    buildCommand: bash bootstrap.sh && npm ci && npm run build -w frontend
+    buildCommand: bash bootstrap.sh && npm ci --include=dev && npm run build -w frontend
     staticPublishPath: frontend/dist
     envVars:
       - key: NODE_VERSION
