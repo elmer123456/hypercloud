@@ -34,7 +34,9 @@ services:
       - key: DRIME_API_BASE_URL
         value: https://app.drime.cloud/api/v1
       - key: FRONTEND_URL
-        value: https://drime-multi-vault-web.onrender.com
+        value: https://hcloud-531q.onrender.com
+      - key: FRONTEND_URLS
+        value: https://hcloud-531q.onrender.com,https://drime-multi-vault-web.onrender.com
   - type: web
     name: drime-multi-vault-web
     runtime: static
