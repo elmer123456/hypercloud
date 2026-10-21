@@ -1,0 +1,66 @@
+name: Build Hyper Cloud Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'hypercloud-release-20261021.b64'
+      - 'bootstrap.sh'
+      - '.github/workflows/build-android.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout project bundle
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-34 build-tools;34.0.0'
+
+      - name: Reconstruct the app source
+        run: bash bootstrap.sh
+
+      - name: Install dependencies
+        run: npm ci --include=dev
+
+      - name: Build bundled app assets
+        run: npm run build -w frontend
+        env:
+          VITE_API_URL: https://drime-multi-vault-api.onrender.com/api
+
+      - name: Generate native Android project
+        working-directory: frontend
+        run: |
+          npx cap add android
+          npx cap sync android
+
+      - name: Build installable APK
+        working-directory: frontend/android
+        run: chmod +x gradlew && ./gradlew --no-daemon assembleDebug
+
+      - name: Publish APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Hyper-Cloud-Android-APK
+          path: frontend/android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 30
