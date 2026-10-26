@@ -22,4 +22,5 @@ if [ -n "$OVERRIDE_FILE" ]; then
   unzip -q -o /tmp/drime-overrides.zip -d .
   echo "Overrides applied from $OVERRIDE_FILE"
 fi
+node -e "const fs=require('node:fs');const l=JSON.parse(fs.readFileSync('package-lock.json','utf8'));const p=JSON.parse(fs.readFileSync('backend/package.json','utf8'));l.packages.backend.dependencies.megajs=p.dependencies.megajs;fs.writeFileSync('package-lock.json',JSON.stringify(l,null,2)+'\\n');"
 echo "Cloud bundle extracted"
