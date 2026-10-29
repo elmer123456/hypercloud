@@ -7,6 +7,7 @@ unzip -q -o /tmp/drime-bundle.zip -d /tmp/drime-bundle
 cp -a /tmp/drime-bundle/drime-multi-vault/. .
 OVERRIDE_FILE=''
 for candidate in \
+  hypercloud-release-logo-v3.b64 \
   hypercloud-release-icon-worker.b64 \
   hypercloud-release-free-fast-site.b64 \
   hypercloud-release-navigation-projects.b64 \
