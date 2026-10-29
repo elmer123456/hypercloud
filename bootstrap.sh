@@ -41,7 +41,7 @@ NODE
 cat > frontend/capacitor.config.json <<'JSON'
 {
   "appId": "com.hypercloud.app",
-  "appName": "Hyper Cloud",
+  "appName": "Hypercloud",
   "webDir": "dist"
 }
 JSON
