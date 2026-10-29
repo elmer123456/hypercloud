@@ -19,7 +19,7 @@ for candidate in \
     break
   fi
 done
-# Preserve frontend/android-icons in the selected bundle for Android APK rebuilds.
+# Keep backend/package.json and frontend/android-icons in the selected bundle for API and APK builds.
 if [ -n "$OVERRIDE_FILE" ]; then
   base64 -d "$OVERRIDE_FILE" > /tmp/drime-overrides.zip
   rm -rf backend/src frontend/src
