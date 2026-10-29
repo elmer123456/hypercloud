@@ -35,3 +35,30 @@ pkg.dependencies['@capacitor/core'] = '^6.2.1';
 pkg.dependencies['@capacitor/filesystem'] = '^6.0.4';
 pkg.dependencies['@capacitor/share'] = '^6.0.4';
 pkg.devDependencies['@capacitor/cli'] = '^6.2.1';
+pkg.devDependencies['@capacitor/android'] = '^6.2.1';
+fs.writeFileSync(file, `${JSON.stringify(pkg, null, 2)}\n`);
+NODE
+cat > frontend/capacitor.config.json <<'JSON'
+{
+  "appId": "com.hypercloud.app",
+  "appName": "Hyper Cloud",
+  "webDir": "dist"
+}
+JSON
+mkdir -p frontend/scripts
+cat > frontend/scripts/patch-android-manifest.mjs <<'JS'
+import fs from 'node:fs';
+
+const manifestPath = 'android/app/src/main/AndroidManifest.xml';
+let manifest = fs.readFileSync(manifestPath, 'utf8');
+if (!manifest.includes('<application')) throw new Error('Android manifest has no <application> element');
+for (const permission of ['android.permission.CAMERA', 'android.permission.RECORD_AUDIO']) {
+  const declaration = `android:name="${permission}"`;
+  if (!manifest.includes(declaration)) {
+    manifest = manifest.replace('<application', `    <uses-permission ${declaration} />\n    <application`);
+  }
+}
+fs.writeFileSync(manifestPath, manifest);
+JS
+npm install --package-lock-only --ignore-scripts --include=dev --no-audit --no-fund
+echo "Cloud bundle extracted and workspace lockfile synchronized"
