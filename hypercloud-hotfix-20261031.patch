@@ -1,0 +1,283 @@
+--- a/backend/src/controllers/pin.ts
++++ b/backend/src/controllers/pin.ts
+@@ -77,6 +77,32 @@
+   });
+ });
+ 
++pinRouter.post('/lock', async (req, res, next) => {
++  try {
++    const parsed = z.object({ pinToken: z.string().min(1).max(4096) }).safeParse(req.body);
++    if (!parsed.success) return res.status(204).end();
++
++    let claims: jwt.JwtPayload;
++    try {
++      claims = jwt.verify(parsed.data.pinToken, `${env.JWT_SECRET}:pin-access`) as jwt.JwtPayload;
++    } catch {
++      return res.status(204).end();
++    }
++    if (claims.sub !== req.userId || claims.scope !== 'sensitive' || typeof claims.pv !== 'number') {
++      return res.status(204).end();
++    }
++
++    // A delayed lock must not invalidate a newer PIN verification.
++    await prisma.user.updateMany({
++      where: { id: req.userId!, pinVersion: claims.pv },
++      data: { pinVersion: { increment: 1 } },
++    });
++    return res.status(204).end();
++  } catch (error) {
++    return next(error);
++  }
++});
++
+ pinRouter.post('/recovery/start', async (req, res, next) => {
+   try {
+     const parsed = recoveryStartBody.safeParse(req.body);
+--- a/backend/src/controllers/projects.ts
++++ b/backend/src/controllers/projects.ts
+@@ -8,7 +8,7 @@
+ const projectBody = z.object({
+   id: z.string().uuid().optional(),
+   name: z.string().trim().min(1).max(120),
+-  summary: z.string().trim().default(''),
++  summary: z.string().trim().max(5000).default(''),
+   status: status.default('IDEA'),
+   repositoryUrl: webUrl,
+   deployUrl: webUrl,
+@@ -19,7 +19,7 @@
+   id: z.string().uuid().optional(),
+   type: z.enum(['IDEA', 'IMPROVEMENT', 'BUG', 'DEPLOYMENT', 'NOTE']).default('NOTE'),
+   title: z.string().trim().min(1).max(160),
+-  body: z.string().trim().default(''),
++  body: z.string().trim().max(10000).default(''),
+ });
+ const idSchema = z.string().uuid();
+ 
+@@ -55,7 +55,8 @@
+   try {
+     if (!idSchema.safeParse(req.params.id).success) return res.status(404).json({ error: 'NOT_FOUND' });
+     const x = projectBody.parse(req.body);
+-    const result = await prisma.project.updateMany({ where: { id: req.params.id, userId: req.userId! }, data: x });
++    const { id: _clientId, ...data } = x;
++    const result = await prisma.project.updateMany({ where: { id: req.params.id, userId: req.userId! }, data });
+     if (!result.count) return res.status(404).json({ error: 'NOT_FOUND' });
+     res.status(204).end();
+   } catch (e) { next(e); }
+--- a/backend/src/app.ts
++++ b/backend/src/app.ts
+@@ -35,8 +35,8 @@
+ 
+ app.set('trust proxy', 1);
+ app.use(
+-  helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' }, contentSecurityPolicy: false, frameguard: false }),
+-  express.json({ limit: '10mb' }),
++  helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' }, contentSecurityPolicy: false, frameguard: { action: 'deny' } }),
++  express.json({ limit: '2mb' }),
+ );
+ app.use('/api/stream', cors(), streamRouter);
+ app.use('/api/public/shares', cors({ origin: trustedFrontendOrigins }), rateLimit({ windowMs: 60000, limit: 30 }), publicSharesRouter);
+--- a/frontend/src/App.tsx
++++ b/frontend/src/App.tsx
+@@ -1,7 +1,7 @@
+-import { lazy, Suspense } from 'react';
+-import { Navigate, Route, Routes } from 'react-router-dom';
++import { lazy, Suspense, useLayoutEffect, useRef } from 'react';
++import { Navigate, Route, Routes, useLocation } from 'react-router-dom';
+ import { Layout } from './pages/Layout';
+-import { PinProtected } from './components/PinProtected';
++import { PinProtected, revokePinSession } from './components/PinProtected';
+ 
+ const Login = lazy(() => import('./pages/Login').then(module => ({ default: module.Login })));
+ const Library = lazy(() => import('./pages/Library').then(module => ({ default: module.Library })));
+@@ -32,8 +32,32 @@
+   return localStorage.getItem('token') ? children : <Navigate to="/login" replace/>;
+ }
+ 
++const PIN_ROUTES = new Set(['/accesses', '/projects', '/vibex']);
++
++function PinSessionBoundary() {
++  const { pathname } = useLocation();
++  const previousPath = useRef<string | null>(null);
++
++  useLayoutEffect(() => {
++    const previous = previousPath.current;
++    previousPath.current = pathname;
++    if (
++      (previous === null && PIN_ROUTES.has(pathname)) ||
++      (previous !== null &&
++        previous !== pathname &&
++        (PIN_ROUTES.has(previous) || PIN_ROUTES.has(pathname)))
++    ) {
++      revokePinSession();
++    }
++  }, [pathname]);
++
++  return null;
++}
++
+ export default function App() {
+   return (
++    <>
++    <PinSessionBoundary />
+     <Routes>
+       <Route path="/login" element={<Page><Login/></Page>}/>
+       <Route path="/activate" element={<Page><ActivationPage/></Page>}/>
+@@ -64,5 +88,6 @@
+         <Route path="*" element={<Navigate to="/" replace/>}/>
+       </Route>
+     </Routes>
++    </>
+   );
+ }
+\ No newline at end of file
+--- a/frontend/src/components/PinProtected.tsx
++++ b/frontend/src/components/PinProtected.tsx
+@@ -26,6 +26,19 @@
+ const PIN_TOKEN_KEY = 'hypercloud-pin-token';
+ const input = 'focus-neon w-full rounded-xl border border-white/10 bg-white/5 px-3 py-3 text-sm text-white';
+ 
++export function revokePinSession() {
++  let token: string | null = null;
++  try {
++    token = sessionStorage.getItem(PIN_TOKEN_KEY);
++    sessionStorage.removeItem(PIN_TOKEN_KEY);
++  } catch {
++    return;
++  }
++  if (token) {
++    void api.post('/security/pin/lock', { pinToken: token }).catch(() => {});
++  }
++}
++
+ function pinError(error: any) {
+   const code = error?.response?.data?.error;
+   if (code === 'INVALID_PIN') return 'Ese PIN no coincide. Inténtalo de nuevo.';
+@@ -140,7 +153,7 @@
+   }, [loadVaultKey]);
+ 
+   const relock = useCallback(() => {
+-    sessionStorage.removeItem(PIN_TOKEN_KEY);
++    revokePinSession();
+     setAuthorized(false);
+     setVaultKey(null);
+     setOfflineProjectKey(null);
+--- a/frontend/src/pages/Projects.tsx
++++ b/frontend/src/pages/Projects.tsx
+@@ -1,4 +1,4 @@
+-import { useEffect, useLayoutEffect, useRef, useState } from 'react';
++import { useEffect, useState } from 'react';
+ import { Dialog, DialogPanel } from '@headlessui/react';
+ import { useQuery, useQueryClient } from '@tanstack/react-query';
+ import { ArrowLeft, Bug, ExternalLink, FolderKanban, Lightbulb, Link2, Pencil, Plus, Rocket, Save, Trash2, Wrench } from 'lucide-react';
+@@ -25,11 +25,8 @@
+ const fresh=():ProjectForm=>({name:'',summary:'',status:'IDEA',repositoryUrl:'',deployUrl:'',currentFocus:'',nextAction:''});
+ const date=(value:string)=>new Date(value).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
+ 
+-function AutoGrowTextarea(props:React.TextareaHTMLAttributes<HTMLTextAreaElement>){
+- const ref=useRef<HTMLTextAreaElement>(null);
+- const resize=()=>{const textarea=ref.current;if(!textarea)return;const maxHeight=Math.min(window.innerHeight*0.45,448);textarea.style.height='auto';const nextHeight=Math.min(textarea.scrollHeight,maxHeight);textarea.style.height=`${nextHeight}px`;textarea.style.overflowY=textarea.scrollHeight>maxHeight?'auto':'hidden';};
+- useLayoutEffect(()=>{resize();},[props.value]);
+- return <textarea {...props} ref={ref} onInput={event=>{props.onInput?.(event);resize();}} style={{...props.style,overflowAnchor:'none',overscrollBehaviorY:'contain'}}/>;
++function StableTextarea(props:React.TextareaHTMLAttributes<HTMLTextAreaElement>){
++ return <textarea {...props} style={{...props.style,overflowY:'auto',overflowAnchor:'none',overscrollBehaviorY:'contain',resize:'none'}}/>;
+ }
+ 
+ export function ProjectsPage(){
+@@ -37,10 +34,10 @@
+  const {offlineProjectKey,offlineMode}=usePinAccess();
+  const [offlineState,setOfflineState]=useState<OfflineProjectState|null>(null),[cacheReady,setCacheReady]=useState(false),[online,setOnline]=useState(navigator.onLine),[wifiReady,setWifiReady]=useState(false);
+  useEffect(()=>{let active=true;setCacheReady(false);if(!offlineProjectKey){setOfflineState(null);setCacheReady(true);return;}void readOfflineProjectState(offlineProjectKey).then(state=>{if(!active)return;setOfflineState(state);if(state){qc.setQueryData(['projects'],state.projects);for(const [id,detail] of Object.entries(state.details))qc.setQueryData(['project',id],detail);}setCacheReady(true);});return()=>{active=false;};},[offlineProjectKey,qc]);
+- const listQ=useQuery<Project[]>({queryKey:['projects'],enabled:cacheReady&&!offlineMode,initialDataUpdatedAt:offlineState?.savedAt,queryFn:async()=>{if(offlineProjectKey)await syncOfflineProjectQueue(offlineProjectKey);const {data}=await api.get<Project[]>('/projects',{timeout:0});const prior=offlineProjectKey?(await readOfflineProjectState(offlineProjectKey)):null;let merged=data;if(prior?.queue.length){const pendingIds=new Set(prior.queue.map(op=>op.projectId));merged=[...merged.filter(p=>!pendingIds.has(p.id)),...prior.projects.filter(p=>pendingIds.has(p.id))];}if(offlineProjectKey){const next=prior||{projects:[],details:{},queue:[],conflictTargets:{},lastSyncedAt:{},savedAt:Date.now()};next.projects=merged;for(const p of data)next.lastSyncedAt[p.id]=p.updatedAt;await writeOfflineProjectState(offlineProjectKey,next);setOfflineState(next);}return merged;},retry:false,refetchOnMount:'always'});
++ const listQ=useQuery<Project[]>({queryKey:['projects'],enabled:cacheReady&&!offlineMode,initialDataUpdatedAt:offlineState?.savedAt,queryFn:async()=>{if(offlineProjectKey)void syncOfflineProjectQueue(offlineProjectKey).catch(()=>{});const {data}=await api.get<Project[]>('/projects',{timeout:2500});const prior=offlineProjectKey?(await readOfflineProjectState(offlineProjectKey)):null;let merged=data;if(prior?.queue.length){const pendingIds=new Set(prior.queue.map(op=>op.projectId));merged=[...merged.filter(p=>!pendingIds.has(p.id)),...prior.projects.filter(p=>pendingIds.has(p.id))];}if(offlineProjectKey){const next=prior||{projects:[],details:{},queue:[],conflictTargets:{},lastSyncedAt:{},savedAt:Date.now()};next.projects=merged;for(const p of data)next.lastSyncedAt[p.id]=p.updatedAt;await writeOfflineProjectState(offlineProjectKey,next);setOfflineState(next);}return merged;},retry:false,refetchOnReconnect:true,refetchOnMount:'always'});
+  const [selectedId,setSelectedId]=useState('');
+  const cachedDetail=selectedId?offlineState?.details[selectedId]:undefined;
+- const detailQ=useQuery<Project>({queryKey:['project',selectedId],queryFn:async()=>{if(offlineProjectKey)await syncOfflineProjectQueue(offlineProjectKey);const {data}=await api.get<Project>(`/projects/${selectedId}`,{timeout:0});if(offlineProjectKey){const state=(await readOfflineProjectState(offlineProjectKey))||{projects:[],details:{},queue:[],conflictTargets:{},lastSyncedAt:{},savedAt:Date.now()};state.details[selectedId]=data;state.lastSyncedAt[selectedId]=data.updatedAt;await writeOfflineProjectState(offlineProjectKey,state);setOfflineState(state);}return data;},enabled:!!selectedId&&cacheReady&&!offlineMode,initialData:cachedDetail,initialDataUpdatedAt:offlineState?.savedAt,retry:false,refetchOnMount:'always'});
++ const detailQ=useQuery<Project>({queryKey:['project',selectedId],queryFn:async()=>{if(offlineProjectKey)void syncOfflineProjectQueue(offlineProjectKey).catch(()=>{});const {data}=await api.get<Project>(`/projects/${selectedId}`,{timeout:2500});if(offlineProjectKey){const state=(await readOfflineProjectState(offlineProjectKey))||{projects:[],details:{},queue:[],conflictTargets:{},lastSyncedAt:{},savedAt:Date.now()};state.details[selectedId]=data;state.lastSyncedAt[selectedId]=data.updatedAt;await writeOfflineProjectState(offlineProjectKey,state);setOfflineState(state);}return data;},enabled:!!selectedId&&cacheReady&&!offlineMode,initialData:cachedDetail,initialDataUpdatedAt:offlineState?.savedAt,retry:false,refetchOnReconnect:true,refetchOnMount:'always'});
+  const [editOpen,setEditOpen]=useState(false),[editingId,setEditingId]=useState(''),[form,setForm]=useState<ProjectForm>(fresh()),[busy,setBusy]=useState(false),[error,setError]=useState('');
+  const [updateTitle,setUpdateTitle]=useState(''),[updateBody,setUpdateBody]=useState(''),[updateType,setUpdateType]=useState<Update['type']>('IMPROVEMENT');
+  const projects=listQ.data||[], active=projects.filter(p=>p.status==='ACTIVE').length, live=projects.filter(p=>p.status==='LIVE').length;
+@@ -67,9 +64,9 @@
+      <div className="mt-5 grid gap-3 sm:grid-cols-2"><div className="rounded-xl bg-white/5 p-3"><small className="text-vault-muted">Enfoque ahora</small><p className="mt-1 text-sm">{selected.currentFocus||'—'}</p></div><div className="rounded-xl bg-vault-primary/5 p-3"><small className="text-vault-primary">Siguiente paso</small><p className="mt-1 text-sm">{selected.nextAction||'—'}</p></div></div>
+      <div className="mt-4 flex flex-wrap gap-2">{selected.repositoryUrl&&<a href={selected.repositoryUrl} target="_blank" rel="noreferrer" className="flex items-center gap-1 rounded-lg border border-white/10 px-3 py-2 text-xs text-vault-primary hover:border-vault-primary"><Link2 size={14}/>Repositorio<ExternalLink size={12}/></a>}{selected.deployUrl&&<a href={selected.deployUrl} target="_blank" rel="noreferrer" className="flex items-center gap-1 rounded-lg border border-white/10 px-3 py-2 text-xs text-vault-primary hover:border-vault-primary"><Rocket size={14}/>App publicada<ExternalLink size={12}/></a>}</div></div>
+     <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(280px,.8fr)]"><section className="glass rounded-2xl p-4 sm:p-5"><h3 className="font-bold">Bitácora del proyecto</h3><p className="mt-1 text-xs text-vault-muted">Guarda qué cambiaste, qué falló y qué quedó desplegado.</p><div className="mt-4 space-y-3">{selected.updates?.length?selected.updates.map(u=>{const meta=updateTypes[u.type]||updateTypes.NOTE,Icon=meta.icon;return <article key={u.id} className="flex gap-3 border-l border-white/10 pl-3"><Icon size={16} className={`mt-0.5 shrink-0 ${meta.color}`}/><div className="min-w-0"><div className="flex flex-wrap items-center gap-2"><b className="text-sm">{u.title}</b><span className="rounded-full bg-white/5 px-2 py-0.5 text-[10px] text-vault-muted">{meta.label}</span></div>{u.body&&<p className="mt-1 whitespace-pre-wrap text-sm text-vault-muted">{u.body}</p>}<small className="mt-1 block text-[10px] text-white/40">{date(u.createdAt)}</small></div></article>;}):<p className="rounded-xl bg-white/5 p-3 text-sm text-vault-muted">Aún no hay movimientos. Anota la primera idea o mejora.</p>}</div></section>
+-     <form onSubmit={addUpdate} className="glass h-fit rounded-2xl p-4 sm:p-5"><h3 className="font-bold">Registrar avance</h3><label className="mt-3 block text-xs text-vault-muted">Tipo<select value={updateType} onChange={e=>setUpdateType(e.target.value as Update['type'])} className={`${field} mt-1`}>{Object.entries(updateTypes).map(([k,v])=><option key={k} value={k} className="bg-black">{v.label}</option>)}</select></label><label className="mt-3 block text-xs text-vault-muted">Qué pasó<input required maxLength={160} value={updateTitle} onChange={e=>setUpdateTitle(e.target.value)} placeholder="Ej. Login de GitHub listo" className={`${field} mt-1`}/></label><label className="mt-3 block text-xs text-vault-muted">Detalle / resultado<AutoGrowTextarea rows={4} value={updateBody} onChange={e=>setUpdateBody(e.target.value)} placeholder="Qué probaste, resultado y qué sigue" className={`${field} mt-1 min-h-24 resize-none overflow-y-auto`}/></label>{error&&<p className="mt-2 text-sm text-red-300">{error}</p>}<button disabled={busy||!updateTitle.trim()} className="mt-3 flex min-h-10 w-full items-center justify-center gap-2 rounded-xl bg-vault-primary font-bold text-black disabled:opacity-50"><Save size={15}/>Guardar avance</button></form></div>
++     <form onSubmit={addUpdate} className="glass h-fit rounded-2xl p-4 sm:p-5"><h3 className="font-bold">Registrar avance</h3><label className="mt-3 block text-xs text-vault-muted">Tipo<select value={updateType} onChange={e=>setUpdateType(e.target.value as Update['type'])} className={`${field} mt-1`}>{Object.entries(updateTypes).map(([k,v])=><option key={k} value={k} className="bg-black">{v.label}</option>)}</select></label><label className="mt-3 block text-xs text-vault-muted">Qué pasó<input required maxLength={160} value={updateTitle} onChange={e=>setUpdateTitle(e.target.value)} placeholder="Ej. Login de GitHub listo" className={`${field} mt-1`}/></label><label className="mt-3 block text-xs text-vault-muted">Detalle / resultado<StableTextarea rows={4} maxLength={10000} value={updateBody} onChange={e=>setUpdateBody(e.target.value)} placeholder="Qué probaste, resultado y qué sigue" className={`${field} mt-1 min-h-24 resize-none overflow-y-auto`}/></label>{error&&<p className="mt-2 text-sm text-red-300">{error}</p>}<button disabled={busy||!updateTitle.trim()} className="mt-3 flex min-h-10 w-full items-center justify-center gap-2 rounded-xl bg-vault-primary font-bold text-black disabled:opacity-50"><Save size={15}/>Guardar avance</button></form></div>
+   </>}</section>}
+   {error&&!selectedId&&<p className="text-sm text-red-300">{error}</p>}
+-  <Dialog open={editOpen} onClose={setEditOpen} className="relative z-50"><div className="fixed inset-0 bg-black/80"/><div className="fixed inset-0 grid items-start justify-items-center overflow-y-auto overscroll-contain p-4"><DialogPanel className="glass my-0 max-h-[calc(100dvh-2rem)] w-full max-w-xl overflow-y-auto overscroll-contain rounded-2xl p-5 sm:p-6"><h2 className="text-xl font-bold">{editingId?'Editar proyecto':'Nuevo proyecto'}</h2><form onSubmit={saveProject} className="mt-4 space-y-3"><label className="block text-xs text-vault-muted">Nombre *<input required maxLength={120} value={form.name} onChange={e=>setForm(f=>({...f,name:e.target.value}))} placeholder="Hypercloud" className={`${field} mt-1`}/></label><label className="block text-xs text-vault-muted">Objetivo / descripción<AutoGrowTextarea rows={3} value={form.summary} onChange={e=>setForm(f=>({...f,summary:e.target.value}))} placeholder="Qué resuelve, para quién y cómo se verá terminado" className={`${field} mt-1 min-h-24 resize-none overflow-y-auto`}/></label><label className="block text-xs text-vault-muted">Estado<select value={form.status} onChange={e=>setForm(f=>({...f,status:e.target.value as Project['status']}))} className={`${field} mt-1`}>{Object.entries(statuses).map(([k,v])=><option key={k} value={k} className="bg-black">{v}</option>)}</select></label><div className="grid gap-3 sm:grid-cols-2"><label className="block text-xs text-vault-muted">Repositorio URL<input type="url" maxLength={500} value={form.repositoryUrl||''} onChange={e=>setForm(f=>({...f,repositoryUrl:e.target.value}))} placeholder="https://github.com/…" className={`${field} mt-1`}/></label><label className="block text-xs text-vault-muted">App publicada<input type="url" maxLength={500} value={form.deployUrl||''} onChange={e=>setForm(f=>({...f,deployUrl:e.target.value}))} placeholder="https://…" className={`${field} mt-1`}/></label></div><label className="block text-xs text-vault-muted">En qué estás trabajando<input maxLength={500} value={form.currentFocus} onChange={e=>setForm(f=>({...f,currentFocus:e.target.value}))} placeholder="Mejorar la biblioteca y los filtros" className={`${field} mt-1`}/></label><label className="block text-xs text-vault-muted">Próxima acción concreta<input maxLength={500} value={form.nextAction} onChange={e=>setForm(f=>({...f,nextAction:e.target.value}))} placeholder="Probar subida de carpeta en Android" className={`${field} mt-1`}/></label>{error&&<p className="text-sm text-red-300">{error}</p>}<button disabled={busy} className="flex min-h-11 w-full items-center justify-center gap-2 rounded-xl bg-vault-primary font-bold text-black disabled:opacity-50"><Save size={15}/>{busy?'Guardando…':'Guardar proyecto'}</button></form></DialogPanel></div></Dialog>
++  <Dialog open={editOpen} onClose={setEditOpen} className="relative z-50"><div className="fixed inset-0 bg-black/80"/><div className="fixed inset-0 grid items-start justify-items-center overflow-y-auto overscroll-contain p-4"><DialogPanel className="glass my-0 max-h-[calc(100dvh-2rem)] w-full max-w-xl overflow-y-auto overscroll-contain rounded-2xl p-5 sm:p-6"><h2 className="text-xl font-bold">{editingId?'Editar proyecto':'Nuevo proyecto'}</h2><form onSubmit={saveProject} className="mt-4 space-y-3"><label className="block text-xs text-vault-muted">Nombre *<input required maxLength={120} value={form.name} onChange={e=>setForm(f=>({...f,name:e.target.value}))} placeholder="Hypercloud" className={`${field} mt-1`}/></label><label className="block text-xs text-vault-muted">Objetivo / descripción<StableTextarea rows={3} maxLength={5000} value={form.summary} onChange={e=>setForm(f=>({...f,summary:e.target.value}))} placeholder="Qué resuelve, para quién y cómo se verá terminado" className={`${field} mt-1 min-h-24 resize-none overflow-y-auto`}/></label><label className="block text-xs text-vault-muted">Estado<select value={form.status} onChange={e=>setForm(f=>({...f,status:e.target.value as Project['status']}))} className={`${field} mt-1`}>{Object.entries(statuses).map(([k,v])=><option key={k} value={k} className="bg-black">{v}</option>)}</select></label><div className="grid gap-3 sm:grid-cols-2"><label className="block text-xs text-vault-muted">Repositorio URL<input type="url" maxLength={500} value={form.repositoryUrl||''} onChange={e=>setForm(f=>({...f,repositoryUrl:e.target.value}))} placeholder="https://github.com/…" className={`${field} mt-1`}/></label><label className="block text-xs text-vault-muted">App publicada<input type="url" maxLength={500} value={form.deployUrl||''} onChange={e=>setForm(f=>({...f,deployUrl:e.target.value}))} placeholder="https://…" className={`${field} mt-1`}/></label></div><label className="block text-xs text-vault-muted">En qué estás trabajando<input maxLength={500} value={form.currentFocus} onChange={e=>setForm(f=>({...f,currentFocus:e.target.value}))} placeholder="Mejorar la biblioteca y los filtros" className={`${field} mt-1`}/></label><label className="block text-xs text-vault-muted">Próxima acción concreta<input maxLength={500} value={form.nextAction} onChange={e=>setForm(f=>({...f,nextAction:e.target.value}))} placeholder="Probar subida de carpeta en Android" className={`${field} mt-1`}/></label>{error&&<p className="text-sm text-red-300">{error}</p>}<button disabled={busy} className="flex min-h-11 w-full items-center justify-center gap-2 rounded-xl bg-vault-primary font-bold text-black disabled:opacity-50"><Save size={15}/>{busy?'Guardando…':'Guardar proyecto'}</button></form></DialogPanel></div></Dialog>
+  </div>;
+ }
+--- a/frontend/src/lib/offlineProjects.ts
++++ b/frontend/src/lib/offlineProjects.ts
+@@ -282,7 +282,7 @@
+       if (!(await canSyncProjectQueueOnWifi())) break;
+       try {
+         if (operation.kind === 'create') {
+-          const { data } = await api.post('/projects', { ...operation.data, id: operation.projectId }, { timeout: 0 });
++          const { data } = await api.post('/projects', { ...operation.data, id: operation.projectId }, { timeout: 2500 });
+           state.lastSyncedAt[operation.projectId] = data.updatedAt || new Date().toISOString();
+         } else if (operation.kind === 'update') {
+           const conflictId = state.conflictTargets[operation.projectId];
+@@ -291,9 +291,9 @@
+               ...operation.data,
+               id: conflictId,
+               name: conflictName(String(operation.data.name || 'Proyecto')),
+-            }, { timeout: 0 });
++            }, { timeout: 2500 });
+           } else {
+-            const { data: current } = await api.get(`/projects/${operation.projectId}`, { timeout: 0 });
++            const { data: current } = await api.get(`/projects/${operation.projectId}`, { timeout: 2500 });
+             const expected = state.lastSyncedAt[operation.projectId] || operation.baseUpdatedAt;
+             if (expected && new Date(current.updatedAt).getTime() !== new Date(expected).getTime()) {
+               const id = crypto.randomUUID();
+@@ -303,17 +303,17 @@
+                 ...operation.data,
+                 id,
+                 name: conflictName(String(operation.data.name || current.name || 'Proyecto')),
+-              }, { timeout: 0 });
++              }, { timeout: 2500 });
+               state.lastSyncedAt[id] = new Date().toISOString();
+             } else {
+-              await api.put(`/projects/${operation.projectId}`, operation.data, { timeout: 0 });
+-              const { data: updated } = await api.get(`/projects/${operation.projectId}`, { timeout: 0 });
++              await api.put(`/projects/${operation.projectId}`, operation.data, { timeout: 2500 });
++              const { data: updated } = await api.get(`/projects/${operation.projectId}`, { timeout: 2500 });
+               state.lastSyncedAt[operation.projectId] = updated.updatedAt;
+             }
+           }
+         } else {
+           const targetId = state.conflictTargets[operation.projectId] || operation.projectId;
+-          await api.post(`/projects/${targetId}/updates`, { ...operation.data, id: operation.updateId }, { timeout: 0 });
++          await api.post(`/projects/${targetId}/updates`, { ...operation.data, id: operation.updateId }, { timeout: 2500 });
+         }
+         state.queue = state.queue.filter(item => item !== operation);
+         synced += 1;
+--- a/backend/package.json
++++ b/backend/package.json
+@@ -25,9 +25,10 @@
+     "express-rate-limit": "^7.4.1",
+     "helmet": "^8.0.0",
+     "jsonwebtoken": "^9.0.2",
++    "megajs": "^1.3.10",
+     "multer": "^2.0.2",
+-    "zod": "^3.23.8",
+-    "megajs": "^1.3.10"
++    "react-router-dom": "^7.18.5",
++    "zod": "^4.6.7"
+   },
+   "devDependencies": {
+     "@types/bcryptjs": "^2.4.6",
+--- a/frontend/package.json
++++ b/frontend/package.json
+@@ -20,8 +20,9 @@
+     "lucide-react": "^0.468.0",
+     "react": "^18.3.1",
+     "react-dom": "^18.3.1",
+-    "react-router-dom": "^6.28.0",
++    "react-router-dom": "^7.18.5",
+     "recharts": "^2.13.3",
++    "zod": "^4.6.7",
+     "zustand": "^5.0.1"
+   },
+   "devDependencies": {
