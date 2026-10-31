@@ -38,6 +38,11 @@ if [ -f hypercloud-pin-lock.patch ]; then
   git apply --whitespace=nowarn hypercloud-pin-lock.patch
   echo "PIN lock-on-exit hotfix applied"
 fi
+if [ -f hypercloud-pin-navigation.patch ]; then
+  git apply --check --whitespace=nowarn hypercloud-pin-navigation.patch
+  git apply --whitespace=nowarn hypercloud-pin-navigation.patch
+  echo "Protected-section navigation hotfix applied"
+fi
 node <<'NODE'
 const fs = require('node:fs');
 const file = 'frontend/package.json';
