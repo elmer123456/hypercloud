@@ -1,0 +1,64 @@
+--- a/frontend/src/App.tsx
++++ b/frontend/src/App.tsx
+@@ -1,4 +1,4 @@
+-import { lazy, Suspense, useLayoutEffect, useRef } from 'react';
++import { lazy, Suspense, useEffect, useLayoutEffect, useRef } from 'react';
+ import { Navigate, Route, Routes, useLocation } from 'react-router-dom';
+ import { Layout } from './pages/Layout';
+ import { PinProtected, revokePinSession } from './components/PinProtected';
+@@ -32,12 +32,31 @@
+   return localStorage.getItem('token') ? children : <Navigate to="/login" replace/>;
+ }
+ 
+-const PIN_ROUTES = new Set(['/accesses', '/projects', '/vibex']);
++const PIN_ROUTES = new Set(['/accesses', '/projects', '/vibex', '/vault', '/authenticator']);
+ 
+ function PinSessionBoundary() {
+   const { pathname } = useLocation();
+   const previousPath = useRef<string | null>(null);
+ 
++  useEffect(() => {
++    const lockWhenHidden = () => {
++      if (document.visibilityState !== 'hidden' || !PIN_ROUTES.has(window.location.pathname)) return;
++      revokePinSession();
++      window.dispatchEvent(new Event('hypercloud-pin-lock'));
++    };
++    const lockWhenLeaving = () => {
++      if (!PIN_ROUTES.has(window.location.pathname)) return;
++      revokePinSession();
++      window.dispatchEvent(new Event('hypercloud-pin-lock'));
++    };
++    document.addEventListener('visibilitychange', lockWhenHidden);
++    window.addEventListener('pagehide', lockWhenLeaving);
++    return () => {
++      document.removeEventListener('visibilitychange', lockWhenHidden);
++      window.removeEventListener('pagehide', lockWhenLeaving);
++    };
++  }, []);
++
+   useLayoutEffect(() => {
+     const previous = previousPath.current;
+     previousPath.current = pathname;
+--- a/frontend/src/components/PinProtected.tsx
++++ b/frontend/src/components/PinProtected.tsx
+@@ -164,12 +164,16 @@
+   }, []);
+ 
+   useEffect(() => {
+-    const onPinRequired = () => {
+-      setError('El PIN venció o ya no es válido. Introdúcelo de nuevo.');
++    const onLock = () => {
++      setError('');
+       relock();
+     };
+-    window.addEventListener('hypercloud-pin-required', onPinRequired);
+-    return () => window.removeEventListener('hypercloud-pin-required', onPinRequired);
++    window.addEventListener('hypercloud-pin-required', onLock);
++    window.addEventListener('hypercloud-pin-lock', onLock);
++    return () => {
++      window.removeEventListener('hypercloud-pin-required', onLock);
++      window.removeEventListener('hypercloud-pin-lock', onLock);
++    };
+   }, [relock]);
+ 
+   async function submit(e: React.FormEvent) {
