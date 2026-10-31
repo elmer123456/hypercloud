@@ -1,0 +1,18 @@
+--- a/frontend/src/App.tsx
++++ b/frontend/src/App.tsx
+@@ -60,11 +60,11 @@
+   useLayoutEffect(() => {
+     const previous = previousPath.current;
+     previousPath.current = pathname;
++    const nextIsProtected = PIN_ROUTES.has(pathname);
++    const previousIsProtected = previous !== null && PIN_ROUTES.has(previous);
+     if (
+-      (previous === null && PIN_ROUTES.has(pathname)) ||
+-      (previous !== null &&
+-        previous !== pathname &&
+-        (PIN_ROUTES.has(previous) || PIN_ROUTES.has(pathname)))
++      (previous === null && nextIsProtected) ||
++      (previous !== null && previous !== pathname && previousIsProtected !== nextIsProtected)
+     ) {
+       revokePinSession();
+     }
