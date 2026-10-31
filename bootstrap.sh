@@ -33,6 +33,11 @@ if [ -f hypercloud-hotfix-20261031.patch ]; then
   git apply --whitespace=nowarn hypercloud-hotfix-20261031.patch
   echo "Reliability and security hotfix applied"
 fi
+if [ -f hypercloud-pin-lock.patch ]; then
+  git apply --check --whitespace=nowarn hypercloud-pin-lock.patch
+  git apply --whitespace=nowarn hypercloud-pin-lock.patch
+  echo "PIN lock-on-exit hotfix applied"
+fi
 node <<'NODE'
 const fs = require('node:fs');
 const file = 'frontend/package.json';
