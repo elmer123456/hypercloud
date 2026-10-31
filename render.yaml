@@ -42,6 +42,19 @@ services:
     runtime: static
     buildCommand: bash bootstrap.sh && npm ci --include=dev && npm run build -w frontend
     staticPublishPath: frontend/dist
+    headers:
+      - path: /*
+        name: X-Frame-Options
+        value: DENY
+      - path: /*
+        name: Content-Security-Policy
+        value: "frame-ancestors 'none'"
+      - path: /*
+        name: X-Content-Type-Options
+        value: nosniff
+      - path: /*
+        name: Referrer-Policy
+        value: no-referrer
     envVars:
       - key: NODE_VERSION
         value: 20.18.0
