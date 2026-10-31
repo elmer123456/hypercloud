@@ -28,6 +28,11 @@ if [ -n "$OVERRIDE_FILE" ]; then
   unzip -q -o /tmp/drime-overrides.zip -d .
   echo "Overrides applied from $OVERRIDE_FILE"
 fi
+if [ -f hypercloud-hotfix-20261031.patch ]; then
+  git apply --check --whitespace=nowarn hypercloud-hotfix-20261031.patch
+  git apply --whitespace=nowarn hypercloud-hotfix-20261031.patch
+  echo "Reliability and security hotfix applied"
+fi
 node <<'NODE'
 const fs = require('node:fs');
 const file = 'frontend/package.json';
@@ -51,6 +56,7 @@ JSON
 mkdir -p frontend/scripts
 cat > frontend/scripts/patch-android-manifest.mjs <<'JS'
 import fs from 'node:fs';
+
 
 const manifestPath = 'android/app/src/main/AndroidManifest.xml';
 let manifest = fs.readFileSync(manifestPath, 'utf8');
