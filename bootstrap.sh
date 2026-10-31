@@ -81,3 +81,8 @@ fs.writeFileSync(manifestPath, manifest);
 JS
 npm install --package-lock-only --ignore-scripts --include=dev --no-audit --no-fund
 echo "Cloud bundle extracted and workspace lockfile synchronized"
+if [ -f hypercloud-app-lock.patch ]; then
+  git apply --check --whitespace=nowarn hypercloud-app-lock.patch
+  git apply --whitespace=nowarn hypercloud-app-lock.patch
+  echo "Optional PIN app lock applied"
+fi
