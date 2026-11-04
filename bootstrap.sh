@@ -7,6 +7,7 @@ unzip -q -o /tmp/drime-bundle.zip -d /tmp/drime-bundle
 cp -a /tmp/drime-bundle/drime-multi-vault/. .
 OVERRIDE_FILE=''
 for candidate in \
+  hypercloud-release-20261104.b64 \
   hypercloud-release-logo-v3.b64 \
   hypercloud-release-icon-worker.b64 \
   hypercloud-release-free-fast-site.b64 \
@@ -28,20 +29,23 @@ if [ -n "$OVERRIDE_FILE" ]; then
   unzip -q -o /tmp/drime-overrides.zip -d .
   echo "Overrides applied from $OVERRIDE_FILE"
 fi
-if [ -f hypercloud-hotfix-20261031.patch ]; then
-  git apply --check --whitespace=nowarn hypercloud-hotfix-20261031.patch
-  git apply --whitespace=nowarn hypercloud-hotfix-20261031.patch
-  echo "Reliability and security hotfix applied"
-fi
-if [ -f hypercloud-pin-lock.patch ]; then
-  git apply --check --whitespace=nowarn hypercloud-pin-lock.patch
-  git apply --whitespace=nowarn hypercloud-pin-lock.patch
-  echo "PIN lock-on-exit hotfix applied"
-fi
-if [ -f hypercloud-pin-navigation.patch ]; then
-  git apply --check --whitespace=nowarn hypercloud-pin-navigation.patch
-  git apply --whitespace=nowarn hypercloud-pin-navigation.patch
-  echo "Protected-section navigation hotfix applied"
+# The newest release bundle already includes the selected PIN/reliability patches.
+if [ "$OVERRIDE_FILE" != "hypercloud-release-20261104.b64" ]; then
+  if [ -f hypercloud-hotfix-20261031.patch ]; then
+    git apply --check --whitespace=nowarn hypercloud-hotfix-20261031.patch
+    git apply --whitespace=nowarn hypercloud-hotfix-20261031.patch
+    echo "Reliability and security hotfix applied"
+  fi
+  if [ -f hypercloud-pin-lock.patch ]; then
+    git apply --check --whitespace=nowarn hypercloud-pin-lock.patch
+    git apply --whitespace=nowarn hypercloud-pin-lock.patch
+    echo "PIN lock-on-exit hotfix applied"
+  fi
+  if [ -f hypercloud-pin-navigation.patch ]; then
+    git apply --check --whitespace=nowarn hypercloud-pin-navigation.patch
+    git apply --whitespace=nowarn hypercloud-pin-navigation.patch
+    echo "Protected-section navigation hotfix applied"
+  fi
 fi
 node <<'NODE'
 const fs = require('node:fs');
@@ -66,22 +70,36 @@ JSON
 mkdir -p frontend/scripts
 cat > frontend/scripts/patch-android-manifest.mjs <<'JS'
 import fs from 'node:fs';
-
+import path from 'node:path';
 
 const manifestPath = 'android/app/src/main/AndroidManifest.xml';
 let manifest = fs.readFileSync(manifestPath, 'utf8');
 if (!manifest.includes('<application')) throw new Error('Android manifest has no <application> element');
 for (const permission of ['android.permission.CAMERA', 'android.permission.RECORD_AUDIO']) {
   const declaration = `android:name="${permission}"`;
-  if (!manifest.includes(declaration)) {
-    manifest = manifest.replace('<application', `    <uses-permission ${declaration} />\n    <application`);
-  }
+  if (!manifest.includes(declaration)) manifest = manifest.replace('<application', `    <uses-permission ${declaration} />\n    <application`);
+}
+for (const feature of ['android.software.leanback', 'android.hardware.touchscreen']) {
+  const declaration = `android:name="${feature}"`;
+  if (!manifest.includes(declaration)) manifest = manifest.replace('<application', `    <uses-feature ${declaration} android:required="false" />\n    <application`);
+}
+manifest = manifest.replace(/<application\b([^>]*)>/, (tag, attributes) => attributes.includes('android:banner=') ? tag : `<application${attributes} android:banner="@drawable/hypercloud_tv_banner">`);
+const launcher = /(<intent-filter>(?:(?!<\/intent-filter>)[\s\S])*?<action\s+android:name="android\.intent\.action\.MAIN"\s*\/>[\s\S]*?<category\s+android:name="android\.intent\.category\.LAUNCHER"\s*\/>)([\s\S]*?<\/intent-filter>)/;
+if (!manifest.includes('android.intent.category.LEANBACK_LAUNCHER')) {
+  if (!launcher.test(manifest)) throw new Error('Android launcher intent filter not found for Leanback support');
+  manifest = manifest.replace(launcher, '$1\n                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />$2');
 }
 fs.writeFileSync(manifestPath, manifest);
+const banner = 'android-icons/tv_banner.png';
+if (fs.existsSync(banner)) {
+  const drawableDir = 'android/app/src/main/res/drawable-nodpi';
+  fs.mkdirSync(drawableDir, { recursive: true });
+  fs.copyFileSync(banner, path.join(drawableDir, 'hypercloud_tv_banner.png'));
+}
 JS
 npm install --package-lock-only --ignore-scripts --include=dev --no-audit --no-fund
 echo "Cloud bundle extracted and workspace lockfile synchronized"
-if [ -f hypercloud-app-lock.patch ]; then
+if [ -f hypercloud-app-lock.patch ] && [ "$OVERRIDE_FILE" != "hypercloud-release-20261104.b64" ]; then
   git apply --check --whitespace=nowarn hypercloud-app-lock.patch
   git apply --whitespace=nowarn hypercloud-app-lock.patch
   echo "Optional PIN app lock applied"
