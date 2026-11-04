@@ -80,6 +80,11 @@ pkg.dependencies['@capacitor/share'] = '^6.0.4';
 pkg.devDependencies['@capacitor/cli'] = '^6.2.1';
 pkg.devDependencies['@capacitor/android'] = '^6.2.1';
 fs.writeFileSync(file, `${JSON.stringify(pkg, null, 2)}\n`);
+const backendFile = 'backend/package.json';
+const backendPkg = JSON.parse(fs.readFileSync(backendFile, 'utf8'));
+backendPkg.dependencies ??= {};
+backendPkg.dependencies.megajs = '^1.3.10';
+fs.writeFileSync(backendFile, `${JSON.stringify(backendPkg, null, 2)}\n`);
 NODE
 cat > frontend/capacitor.config.json <<'JSON'
 {
