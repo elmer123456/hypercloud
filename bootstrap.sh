@@ -7,6 +7,7 @@ unzip -q -o /tmp/drime-bundle.zip -d /tmp/drime-bundle
 cp -a /tmp/drime-bundle/drime-multi-vault/. .
 OVERRIDE_FILE=''
 for candidate in \
+  hypercloud-release-20261105.b64 \
   hypercloud-release-20261104.b64 \
   hypercloud-release-logo-v3.b64 \
   hypercloud-release-icon-worker.b64 \
@@ -29,13 +30,26 @@ if [ -n "$OVERRIDE_FILE" ]; then
   unzip -q -o /tmp/drime-overrides.zip -d .
   echo "Overrides applied from $OVERRIDE_FILE"
 fi
-if [ -f hypercloud-hotfix-20261104-r2.patch ]; then
+# Release bundles store backend sources at backend/, while workspace builds expect backend/src/.
+if [ -f backend/app.ts ] && [ ! -f backend/src/app.ts ]; then
+  mkdir -p backend/src
+  for source in app.ts config.ts crypto.ts lib.ts controllers middleware prisma services types workers; do
+    if [ -e "backend/$source" ]; then
+      mv "backend/$source" backend/src/
+    fi
+  done
+fi
+if [ ! -f backend/src/app.ts ] || [ ! -f backend/src/prisma/schema.prisma ]; then
+  echo "Backend source is incomplete: expected backend/src/app.ts and backend/src/prisma/schema.prisma" >&2
+  exit 1
+fi
+if [ "$OVERRIDE_FILE" != "hypercloud-release-20261105.b64" ] && [ -f hypercloud-hotfix-20261104-r2.patch ]; then
   git apply --check --whitespace=nowarn hypercloud-hotfix-20261104-r2.patch
   git apply --whitespace=nowarn hypercloud-hotfix-20261104-r2.patch
   echo "Upload continuity, PIN cadence, and Android TV fixes applied"
 fi
 # The newest release bundle already includes the selected PIN/reliability patches.
-if [ "$OVERRIDE_FILE" != "hypercloud-release-20261104.b64" ]; then
+if [ "$OVERRIDE_FILE" != "hypercloud-release-20261104.b64" ] && [ "$OVERRIDE_FILE" != "hypercloud-release-20261105.b64" ]; then
   if [ -f hypercloud-hotfix-20261031.patch ]; then
     git apply --check --whitespace=nowarn hypercloud-hotfix-20261031.patch
     git apply --whitespace=nowarn hypercloud-hotfix-20261031.patch
@@ -79,6 +93,7 @@ cat > frontend/scripts/patch-android-manifest.mjs <<'JS'
 import fs from 'node:fs';
 import path from 'node:path';
 
+
 const manifestPath = 'android/app/src/main/AndroidManifest.xml';
 let manifest = fs.readFileSync(manifestPath, 'utf8');
 if (!manifest.includes('<application')) throw new Error('Android manifest has no <application> element');
@@ -106,7 +121,7 @@ if (fs.existsSync(banner)) {
 JS
 npm install --package-lock-only --ignore-scripts --include=dev --no-audit --no-fund
 echo "Cloud bundle extracted and workspace lockfile synchronized"
-if [ -f hypercloud-app-lock.patch ] && [ "$OVERRIDE_FILE" != "hypercloud-release-20261104.b64" ]; then
+if [ -f hypercloud-app-lock.patch ] && [ "$OVERRIDE_FILE" != "hypercloud-release-20261104.b64" ] && [ "$OVERRIDE_FILE" != "hypercloud-release-20261105.b64" ]; then
   git apply --check --whitespace=nowarn hypercloud-app-lock.patch
   git apply --whitespace=nowarn hypercloud-app-lock.patch
   echo "Optional PIN app lock applied"
