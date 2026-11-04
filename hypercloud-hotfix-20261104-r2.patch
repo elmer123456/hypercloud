@@ -1,0 +1,99 @@
+diff --git a/frontend/src/App.tsx b/frontend/src/App.tsx
+index 3e1349f..e5eee9e 100644
+--- a/frontend/src/App.tsx
++++ b/frontend/src/App.tsx
+@@ -48,7 +48,9 @@ function Private({ children }: { children: JSX.Element }) {
+ }
+ 
+ const PIN_ROUTES = new Set(['/accesses', '/projects', '/vibex', '/vault', '/authenticator']);
+-const PIN_IDLE_TIMEOUT_MS = 10 * 60 * 1000;
++// Keep protected sessions convenient during active use; background lock and
++// the server-side session expiry still provide independent security limits.
++const PIN_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
+ const PIN_BACKGROUND_GRACE_MS = 5 * 60 * 1000;
+ const PIN_LAST_ACTIVE_KEY = 'hypercloud-pin-last-active';
+ const PIN_TOKEN_KEY = 'hypercloud-pin-token';
+diff --git a/frontend/src/components/Header.tsx b/frontend/src/components/Header.tsx
+index f44e7a4..1368f08 100644
+--- a/frontend/src/components/Header.tsx
++++ b/frontend/src/components/Header.tsx
+@@ -14,8 +14,8 @@ export function Header(){const toggle=useUI(s=>s.toggleSidebar),upload=useUpload
+   <div className="ml-auto flex min-w-0 flex-1 items-center gap-2 rounded-xl border border-white/10 px-3 py-2 focus-within:border-vault-primary sm:max-w-md"><Search size={16} className="shrink-0 text-vault-muted"/><input ref={input} value={q} onChange={e=>setQ(e.target.value)} className="min-w-0 flex-1 bg-transparent outline-none" placeholder="Buscar archivos"/>{q&&<button onClick={()=>setQ('')} aria-label="Limpiar"><X size={15}/></button>}</div>
+   <HMenu as="div" className="relative"><MenuButton className="flex items-center gap-1 rounded-xl bg-vault-primary px-3 py-2 font-bold text-black hover:shadow-neon"><Upload size={17}/><span className="hidden max-w-[12rem] truncate sm:inline">Subir{tgt?` → ${accs.find((a:any)=>a.id===tgt)?.name}`:''}</span></MenuButton>
+    <MenuItems anchor="bottom end" className="glass z-50 mt-2 max-h-[70vh] w-72 overflow-y-auto rounded-xl p-1 text-sm"><div className="px-2 pb-1 pt-2 text-xs font-bold uppercase text-vault-muted">Destino</div><MenuItem><button onClick={(e)=>{e.preventDefault();setTarget('');}} className={`flex w-full items-start gap-2 rounded-lg p-2 text-left data-[focus]:bg-white/10 ${!tgt?'text-vault-primary':''}`}><span className="w-4">{!tgt?'✓':''}</span><span><b className="block">Automático (modo normal)</b><span className="text-xs text-vault-muted">Hypercloud elige la cuenta según tus reglas</span></span></button></MenuItem>{accs.map((a:any)=>{const free=Number(a.totalSpace)-Number(a.usedSpace),off=!a.isActive;return <MenuItem key={a.id} disabled={off}><button onClick={(e)=>{e.preventDefault();setTarget(a.id);}} className={`flex w-full items-center gap-2 rounded-lg p-2 text-left data-[focus]:bg-white/10 data-[disabled]:opacity-40 ${tgt===a.id?'text-vault-primary':''}`}><span className="w-4">{tgt===a.id?'✓':''}</span><ProviderBadge p={a.provider}/><span className="min-w-0 flex-1"><b className="block truncate">{a.name}</b><span className="block truncate text-xs text-vault-muted">{a.email} · {bytes(Math.max(free,0))} libres{off?' · pausada':''}</span></span></button></MenuItem>;})}<div className="my-1 border-t border-white/10"/><MenuItem><button onClick={()=>fileIn.current?.click()} className="flex w-full items-center gap-2 rounded-lg p-2 text-left data-[focus]:bg-white/10"><FilePlus size={16}/>Subir archivos</button></MenuItem><MenuItem><button onClick={()=>dirIn.current?.click()} className="flex w-full items-center gap-2 rounded-lg p-2 text-left data-[focus]:bg-white/10"><FolderUp size={16}/>Subir carpeta</button></MenuItem></MenuItems></HMenu>
+-  <input ref={fileIn} className="hidden" type="file" multiple onChange={e=>{if(e.target.files?.length)upload(e.target.files,here);e.target.value='';}}/>
+-  <input ref={dirIn} className="hidden" type="file" multiple {...({webkitdirectory:'',directory:''} as any)} onChange={e=>{if(e.target.files?.length)upload(e.target.files,here);e.target.value='';}}/>
++  <input ref={fileIn} className="hidden" type="file" multiple onChange={e=>{const input=e.currentTarget,files=Array.from(input.files||[]);if(files.length)void upload(files,here);input.value='';}}/>
++  <input ref={dirIn} className="hidden" type="file" multiple {...({webkitdirectory:'',directory:''} as any)} onChange={e=>{const input=e.currentTarget,files=Array.from(input.files||[]);if(files.length)void upload(files,here);input.value='';}}/>
+   <AppLockButton/>
+   <div className="relative" ref={box}><button aria-label="Notificaciones" onClick={()=>{setOpen(!open);if(!open&&n.data?.unread)read.mutate();}} className="relative p-1 hover:text-vault-primary"><Bell/>{!!n.data?.unread&&<span className="absolute -right-1 -top-1 grid h-5 min-w-5 place-items-center rounded-full bg-vault-error px-1 text-xs font-bold">{n.data.unread}</span>}</button>
+    <AnimatePresence>{open&&<motion.div initial={{opacity:0,y:-6}} animate={{opacity:1,y:0}} exit={{opacity:0,y:-6}} className="glass absolute right-0 top-10 max-h-96 w-80 overflow-auto rounded-2xl p-3"><b className="mb-2 block">Notificaciones</b>{!n.data?.items.length&&<p className="text-sm text-vault-muted">Sin notificaciones</p>}{n.data?.items.map(x=><div key={x.id} className="mb-2 rounded-xl bg-white/5 p-3 text-sm"><div className={x.type==='SPACE_WARNING'||x.type==='KEEPALIVE'?'font-bold text-yellow-300':'font-bold text-vault-error'}>{x.title}</div><div>{x.message}</div><small className="text-vault-muted">{x.account?.name} · {when(x.createdAt)}</small></div>)}</motion.div>}</AnimatePresence></div>
+diff --git a/frontend/src/hooks/useUpload.ts b/frontend/src/hooks/useUpload.ts
+index ae01e55..53508a3 100644
+--- a/frontend/src/hooks/useUpload.ts
++++ b/frontend/src/hooks/useUpload.ts
+@@ -243,13 +243,17 @@ export function useUpload() {
+   const setUpload = useUI(state => state.setUpload);
+ 
+   return async (input: UploadInput, basePath = '/', targetOverride?: string | null) => {
++    // Snapshot FileList before yielding to an async generator. Native pickers can
++    // clear or invalidate their FileList as soon as the dialog closes.
++    const directItems = isAsyncIterable(input)
++      ? null
++      : Array.isArray(input) && input.length && 'file' in (input[0] as any)
++        ? input as UploadItem[]
++        : fromFileList(input as FileList | File[]);
+     const iterable: AsyncIterable<UploadItem> = isAsyncIterable(input)
+       ? input
+       : (async function* items() {
+-          const list = Array.isArray(input) && input.length && 'file' in (input[0] as any)
+-            ? input as UploadItem[]
+-            : fromFileList(input as FileList | File[]);
+-          for (const item of list) yield item;
++          for (const item of directItems || []) yield item;
+         })();
+     const iterator = iterable[Symbol.asyncIterator]();
+     const target = targetOverride === null
+@@ -279,6 +283,8 @@ export function useUpload() {
+         };
+         const index = nextIndex++;
+         tasks.push(task);
++        // Surface feedback immediately while IndexedDB snapshots a large File.
++        setUpload({ id: task.id, name: task.name, progress: 0, status: 'uploading' });
+         try {
+           await saveUploadTask(task);
+         } catch {
+@@ -310,11 +316,18 @@ export function useResumePendingUploads() {
+     void resume(false);
+     const onOnline = () => { void resume(false); };
+     const onManualResume = () => { void resume(true); };
++    const onForeground = () => {
++      if (document.visibilityState === 'visible') void resume(false);
++    };
+     window.addEventListener('online', onOnline);
++    window.addEventListener('pageshow', onForeground);
++    document.addEventListener('visibilitychange', onForeground);
+     window.addEventListener('hypercloud-resume-uploads', onManualResume);
+     return () => {
+       mounted = false;
+       window.removeEventListener('online', onOnline);
++      window.removeEventListener('pageshow', onForeground);
++      document.removeEventListener('visibilitychange', onForeground);
+       window.removeEventListener('hypercloud-resume-uploads', onManualResume);
+     };
+   }, [queryClient, setUpload]);
+diff --git a/frontend/src/lib/displayMode.ts b/frontend/src/lib/displayMode.ts
+index 78465fc..f8aac17 100644
+--- a/frontend/src/lib/displayMode.ts
++++ b/frontend/src/lib/displayMode.ts
+@@ -22,6 +22,7 @@ export function detectTvDisplay(): boolean {
+   const height = Math.max(window.innerHeight, window.screen?.height || 0);
+   const wideLandscape = width >= 1280 && height >= 720 && width / height >= 1.5;
+   const notPhone = !/mobile|iphone|ipad|ipod/i.test(ua);
+-  const touchPoints = navigator.maxTouchPoints || 0;
+-  return wideLandscape && notPhone && touchPoints <= 1;
++  // Some Android TVs report touch capability even though users navigate with
++  // a remote. A large, non-phone Android viewport is a stronger signal.
++  return wideLandscape && notPhone;
+ }
+\ No newline at end of file
