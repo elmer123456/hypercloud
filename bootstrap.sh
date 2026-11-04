@@ -7,6 +7,7 @@ unzip -q -o /tmp/drime-bundle.zip -d /tmp/drime-bundle
 cp -a /tmp/drime-bundle/drime-multi-vault/. .
 OVERRIDE_FILE=''
 for candidate in \
+  hypercloud-release-20261104-r2.b64 \
   hypercloud-release-20261104.b64 \
   hypercloud-release-logo-v3.b64 \
   hypercloud-release-icon-worker.b64 \
@@ -30,7 +31,7 @@ if [ -n "$OVERRIDE_FILE" ]; then
   echo "Overrides applied from $OVERRIDE_FILE"
 fi
 # The newest release bundle already includes the selected PIN/reliability patches.
-if [ "$OVERRIDE_FILE" != "hypercloud-release-20261104.b64" ]; then
+if [ "$OVERRIDE_FILE" != "hypercloud-release-20261104-r2.b64" ] && [ "$OVERRIDE_FILE" != "hypercloud-release-20261104.b64" ]; then
   if [ -f hypercloud-hotfix-20261031.patch ]; then
     git apply --check --whitespace=nowarn hypercloud-hotfix-20261031.patch
     git apply --whitespace=nowarn hypercloud-hotfix-20261031.patch
@@ -101,7 +102,7 @@ if (fs.existsSync(banner)) {
 JS
 npm install --package-lock-only --ignore-scripts --include=dev --no-audit --no-fund
 echo "Cloud bundle extracted and workspace lockfile synchronized"
-if [ -f hypercloud-app-lock.patch ] && [ "$OVERRIDE_FILE" != "hypercloud-release-20261104.b64" ]; then
+if [ -f hypercloud-app-lock.patch ] && [ "$OVERRIDE_FILE" != "hypercloud-release-20261104-r2.b64" ] && [ "$OVERRIDE_FILE" != "hypercloud-release-20261104.b64" ]; then
   git apply --check --whitespace=nowarn hypercloud-app-lock.patch
   git apply --whitespace=nowarn hypercloud-app-lock.patch
   echo "Optional PIN app lock applied"
