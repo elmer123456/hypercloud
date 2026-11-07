@@ -8,7 +8,7 @@
 +// vault reads pending and retry transient startup failures instead of showing
 +// a false vault error after a short timeout. This runs only for user-triggered
 +// reads; it is not a background keepalive.
-+const STARTUP_READ_DEADLINE_MS = 120_000;
++const STARTUP_READ_DEADLINE_MS = 75_000;
 +const STARTUP_READ_ATTEMPT_TIMEOUT_MS = 20_000;
 +
 +export async function getWithStartupRetry<T = unknown>(url: string, signal?: AbortSignal) {
