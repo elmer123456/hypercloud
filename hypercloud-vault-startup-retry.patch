@@ -1,0 +1,135 @@
+--- a/frontend/src/services/api.ts
++++ b/frontend/src/services/api.ts
+@@ -5,6 +5,41 @@
+ export const api = axios.create({ baseURL });
+ export const publicApi = axios.create({ baseURL });
+ 
++// Render's free API can take around a minute to wake after inactivity. Keep
++// vault reads pending and retry transient startup failures instead of showing
++// a false vault error after a short timeout. This runs only for user-triggered
++// reads; it is not a background keepalive.
++const STARTUP_READ_DEADLINE_MS = 120_000;
++const STARTUP_READ_ATTEMPT_TIMEOUT_MS = 20_000;
++
++export async function getWithStartupRetry<T = unknown>(url: string, signal?: AbortSignal) {
++  const deadline = Date.now() + STARTUP_READ_DEADLINE_MS;
++  let attempt = 0;
++
++  while (true) {
++    const remaining = deadline - Date.now();
++    if (remaining <= 0) throw new Error('API_STARTUP_TIMEOUT');
++
++    try {
++      return await api.get<T>(url, {
++        timeout: Math.min(STARTUP_READ_ATTEMPT_TIMEOUT_MS, remaining),
++        signal,
++      });
++    } catch (error) {
++      if (signal?.aborted) throw error;
++      const status = axios.isAxiosError(error) ? error.response?.status : undefined;
++      const transient = axios.isAxiosError(error) &&
++        (!status || status === 408 || status === 429 || status >= 500);
++      const timeLeft = deadline - Date.now();
++      if (!transient || timeLeft <= 0) throw error;
++
++      const delay = Math.min(1_000 * (2 ** Math.min(attempt, 3)), 8_000, timeLeft);
++      await new Promise(resolve => window.setTimeout(resolve, delay));
++      attempt += 1;
++    }
++  }
++}
++
+ api.interceptors.request.use(config => {
+   const token = localStorage.getItem('token');
+   if (token) config.headers.Authorization = `Bearer ${token}`;
+--- a/frontend/src/pages/Vault.tsx
++++ b/frontend/src/pages/Vault.tsx
+@@ -2,7 +2,7 @@
+ import { useQuery, useQueryClient } from '@tanstack/react-query';
+ import { Dialog, DialogPanel, DialogTitle } from '@headlessui/react';
+ import { Archive, Check, Copy, ExternalLink, Eye, EyeOff, KeyRound, Lock, Plus, Search, ShieldCheck, Trash2, X } from 'lucide-react';
+-import { api } from '../services/api';
++import { api, getWithStartupRetry } from '../services/api';
+ import { decryptVaultSecret, emptyVaultSecret, encryptVaultSecret, type VaultSecret } from '../lib/vaultCrypto';
+ import { usePinAccess } from '../components/PinProtected';
+ 
+@@ -20,9 +20,9 @@
+ export function VaultPage() {
+   const qc = useQueryClient();
+   const pinAccess = usePinAccess();
+-  const configQ = useQuery({ queryKey: ['vault-config'], queryFn: async()=> (await api.get('/vault/config', { timeout: 15_000 })).data as {configured:boolean;salt?:string|null;checkCiphertext?:string|null;wrappedKey?:boolean}, retry: false });
+-  const entriesQ = useQuery({ queryKey: ['vault-items'], queryFn: async()=> (await api.get('/vault/items', { timeout: 15_000 })).data as Entry[], retry: false });
+-  const projectsQ = useQuery({ queryKey: ['projects'], queryFn: async()=> (await api.get('/projects', { timeout: 15_000 })).data as Project[], retry: false });
++  const configQ = useQuery({ queryKey: ['vault-config'], queryFn: async ({ signal }) => (await getWithStartupRetry('/vault/config', signal)).data as {configured:boolean;salt?:string|null;checkCiphertext?:string|null;wrappedKey?:boolean}, retry: false });
++  const entriesQ = useQuery({ queryKey: ['vault-items'], queryFn: async ({ signal }) => (await getWithStartupRetry('/vault/items', signal)).data as Entry[], retry: false });
++  const projectsQ = useQuery({ queryKey: ['projects'], queryFn: async ({ signal }) => (await getWithStartupRetry('/projects', signal)).data as Project[], retry: false });
+   const key = pinAccess.vaultKey;
+   const [unlockError, setUnlockError] = useState('');
+   const [busy, setBusy] = useState(false);
+@@ -116,7 +116,7 @@
+     return matchFilter&&text.includes(search.trim().toLowerCase());
+   }),[entries,filter,search,secrets,projects]);
+ 
+-  if (configQ.isLoading || entriesQ.isLoading) return <div role="status" className="glass rounded-2xl p-6 text-sm text-vault-muted"><span className="mr-2 inline-block h-3 w-3 animate-spin rounded-full border-2 border-white/20 border-t-vault-primary align-[-2px]"/>Cargando accesos…</div>;
++  if (configQ.isLoading || entriesQ.isLoading) return <div role="status" className="glass rounded-2xl p-6 text-sm text-vault-muted"><span className="mr-2 inline-block h-3 w-3 animate-spin rounded-full border-2 border-white/20 border-t-vault-primary align-[-2px]"/>Conectando con el servicio. Si se está activando, puede tardar un minuto; tus accesos no se modificarán.</div>;
+   if (configQ.isError || entriesQ.isError) return (
+     <section role="alert" className="glass rounded-2xl border-red-400/20 p-6">
+       <h2 className="font-bold text-red-200">No se pudieron cargar los accesos</h2>
+--- a/frontend/src/pages/Authenticator.tsx
++++ b/frontend/src/pages/Authenticator.tsx
+@@ -2,7 +2,7 @@
+ import { useQuery, useQueryClient } from '@tanstack/react-query';
+ import { Dialog, DialogPanel, DialogTitle } from '@headlessui/react';
+ import { Camera, Check, Copy, LockKeyhole, Pencil, Plus, ShieldCheck, Trash2, X } from 'lucide-react';
+-import { api } from '../services/api';
++import { api, getWithStartupRetry } from '../services/api';
+ import { decryptVaultSecret, emptyVaultSecret, encryptVaultSecret, generateTotp, totpRemaining, validTotpInput, type VaultSecret } from '../lib/vaultCrypto';
+ import { usePinAccess } from '../components/PinProtected';
+ 
+@@ -28,7 +28,7 @@
+ export function AuthenticatorPage() {
+   const qc = useQueryClient();
+   const pinAccess = usePinAccess();
+-  const tokensQ = useQuery({ queryKey: ['authenticator-tokens'], queryFn: async () => (await api.get('/authenticator/tokens', { timeout: 15_000 })).data as Token[], retry: false });
++  const tokensQ = useQuery({ queryKey: ['authenticator-tokens'], queryFn: async ({ signal }) => (await getWithStartupRetry('/authenticator/tokens', signal)).data as Token[], retry: false });
+   const key = pinAccess.vaultKey;
+   const [error, setError] = useState('');
+   const [busy, setBusy] = useState(false);
+@@ -130,7 +130,7 @@
+   }
+   function lock() { pinAccess.relock(); setSecrets({}); setModal(false); stopScanner(); }
+ 
+-  if (tokensQ.isLoading) return <div role="status" className="glass rounded-2xl p-6 text-sm text-vault-muted"><span className="mr-2 inline-block h-3 w-3 animate-spin rounded-full border-2 border-white/20 border-t-vault-primary align-[-2px]"/>Cargando autenticador…</div>;
++  if (tokensQ.isLoading) return <div role="status" className="glass rounded-2xl p-6 text-sm text-vault-muted"><span className="mr-2 inline-block h-3 w-3 animate-spin rounded-full border-2 border-white/20 border-t-vault-primary align-[-2px]"/>Conectando con el servicio. Si se está activando, puede tardar un minuto; tus códigos no se modificarán.</div>;
+   if (tokensQ.isError) return (
+     <section role="alert" className="glass rounded-2xl border-red-400/20 p-6">
+       <h2 className="font-bold text-red-200">No se pudieron cargar los códigos 2FA</h2>
+--- a/frontend/src/pages/AccessesHub.tsx
++++ b/frontend/src/pages/AccessesHub.tsx
+@@ -5,7 +5,7 @@
+ import { useQuery, useQueryClient } from '@tanstack/react-query';
+ import { VaultPage } from './Vault';
+ import { AuthenticatorPage } from './Authenticator';
+-import { api } from '../services/api';
++import { api, getWithStartupRetry } from '../services/api';
+ import { usePinAccess } from '../components/PinProtected';
+ import {
+   createManagedVaultKeyMaterial, decryptVaultSecret, encryptVaultSecret,
+@@ -24,7 +24,7 @@
+   const pinAccess = usePinAccess();
+   const configQ = useQuery({
+     queryKey: ['vault-config'],
+-    queryFn: async () => (await api.get('/vault/config', { timeout: 15_000 })).data as VaultConfig,
++    queryFn: async ({ signal }) => (await getWithStartupRetry('/vault/config', signal)).data as VaultConfig,
+     retry: false,
+   });
+   const tab: Tab = params.get('tab') === '2fa' ? '2fa' : 'accesses';
+@@ -176,7 +176,7 @@
+     }
+   }
+ 
+-  if (configQ.isLoading) return <div role="status" className="glass rounded-2xl p-6 text-sm text-vault-muted"><span className="mr-2 inline-block h-3 w-3 animate-spin rounded-full border-2 border-white/20 border-t-vault-primary align-[-2px]"/>Comprobando la bóveda…</div>;
++  if (configQ.isLoading) return <div role="status" className="glass rounded-2xl p-6 text-sm text-vault-muted"><span className="mr-2 inline-block h-3 w-3 animate-spin rounded-full border-2 border-white/20 border-t-vault-primary align-[-2px]"/>Conectando con el servicio; puede tardar un minuto si se está activando. La bóveda no se modificará.</div>;
+   if (configQ.isError) return (
+     <section role="alert" className="glass rounded-2xl border-red-400/20 p-6">
+       <h2 className="font-bold text-red-200">No se pudo comprobar la bóveda</h2>
