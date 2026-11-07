@@ -39,6 +39,11 @@ if [ -f backend/app.ts ] && [ ! -f backend/src/app.ts ]; then
     fi
   done
 fi
+if [ "$OVERRIDE_FILE" = "hypercloud-release-20261105.b64" ] && [ -f hypercloud-vault-startup-retry.patch ]; then
+  git apply --check --whitespace=nowarn hypercloud-vault-startup-retry.patch
+  git apply --whitespace=nowarn hypercloud-vault-startup-retry.patch
+  echo "Vault startup retry patch applied"
+fi
 if [ ! -f backend/src/app.ts ] || [ ! -f backend/src/prisma/schema.prisma ]; then
   echo "Backend source is incomplete: expected backend/src/app.ts and backend/src/prisma/schema.prisma" >&2
   exit 1
