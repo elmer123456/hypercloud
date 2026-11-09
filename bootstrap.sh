@@ -31,14 +31,134 @@ if [ -n "$OVERRIDE_FILE" ]; then
   unzip -q -o /tmp/drime-overrides.zip -d .
   echo "Overrides applied from $OVERRIDE_FILE"
 fi
-# Replace the admin activation-code interstitial with the subscription page after signup.
+# Subscription signup plus private 12-character, one-use activation codes.
 node <<'NODE'
 const fs = require('node:fs');
 function replaceOnce(file, before, after) {
   const source = fs.readFileSync(file, 'utf8');
-  if (!source.includes(before)) throw new Error(`Expected pattern missing in ${file}`);
+  if (!source.includes(before)) throw new Error(`Expected pattern missing in ${file}: ${before.slice(0, 90)}`);
   fs.writeFileSync(file, source.replace(before, after));
 }
+replaceOnce('backend/src/controllers/admin.ts', `  const parsed = z.object({
+    quantity: z.coerce.number().int().min(1).max(5000),
+    maxUses: z.coerce.number().int().min(1).max(10000).default(1),
+    expiresAt: z.string().datetime().optional(),
+    note: z.string().trim().max(300).optional(),
+  }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'INVALID_INPUT' });
+  const codes: { code: string; codeHash: string; codeLabel: string; maxUses: number; expiresAt: Date | null; note: string | null }[] = [];
+  const seen = new Set<string>();
+  while (codes.length < parsed.data.quantity) {
+    const raw = crypto.randomBytes(16).toString('hex').toUpperCase();
+    const code = \`HC-\${raw.match(/.{1,4}/gu)!.join('-')}\`;
+    const hash = crypto.createHmac('sha256', env.JWT_SECRET).update(raw).digest('hex');
+    if (seen.has(hash)) continue;
+    seen.add(hash);
+    codes.push({
+      code,
+      codeHash: hash,
+      codeLabel: \`HC-\${raw.slice(-4)}\`,
+      maxUses: parsed.data.maxUses,
+      expiresAt: parsed.data.expiresAt ? new Date(parsed.data.expiresAt) : null,
+      note: parsed.data.note || null,
+    });
+  }
+  await prisma.activationCode.createMany({
+    data: codes.map(({ codeHash: hash, codeLabel, maxUses, expiresAt, note }) => ({ codeHash: hash, codeLabel, maxUses, expiresAt, note })),
+  });
+  res.status(201).json({ codes: codes.map(({ code }) => code), count: codes.length });`, `  const parsed = z.object({
+    quantity: z.coerce.number().int().min(1).max(5000),
+    note: z.string().trim().max(300).optional(),
+  }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'INVALID_INPUT' });
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  const codes: { code: string; codeHash: string; codeLabel: string; maxUses: number; expiresAt: Date; note: string | null }[] = [];
+  const seen = new Set<string>();
+  while (codes.length < parsed.data.quantity) {
+    let code = '';
+    for (let i = 0; i < 12; i++) code += alphabet[crypto.randomInt(alphabet.length)];
+    const hash = crypto.createHmac('sha256', env.JWT_SECRET).update(code).digest('hex');
+    if (seen.has(hash)) continue;
+    seen.add(hash);
+    codes.push({ code, codeHash: hash, codeLabel: code.slice(-4), maxUses: 1, expiresAt: new Date(Date.now() + 5 * 60_000), note: parsed.data.note || null });
+  }
+  await prisma.activationCode.createMany({
+    data: codes.map(({ codeHash, codeLabel, maxUses, expiresAt, note }) => ({ codeHash, codeLabel, maxUses, expiresAt, note })),
+  });
+  res.status(201).json({ codes: codes.map(({ code }) => code), count: codes.length });`);
+replaceOnce('backend/src/controllers/auth.ts', `    const parsed = credentials.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: 'INVALID_INPUT' });
+    if (env.ALLOW_REGISTRATION === 'false') {
+      return res.status(403).json({ error: 'REGISTRATION_CLOSED' });
+    }
+
+    const email = parsed.data.email.toLowerCase();
+    if (await prisma.user.findUnique({ where: { email } })) {
+      return res.status(409).json({ error: 'EMAIL_IN_USE' });
+    }
+
+    const user = await prisma.user.create({
+      data: { email, passwordHash: await bcrypt.hash(parsed.data.password, 12) },
+      select: { id: true, authVersion: true },
+    });
+    await prisma.user.update({ where: { id: user.id }, data: { activatedAt: null } });
+    res.status(201).json({
+      activationRequired: true,
+      activationToken: issueActivationToken(user.id),
+    });`, `    const parsed = credentials.extend({ activationCode: z.string().trim().max(32).optional() }).safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: 'INVALID_INPUT' });
+    if (env.ALLOW_REGISTRATION === 'false') {
+      return res.status(403).json({ error: 'REGISTRATION_CLOSED' });
+    }
+
+    const email = parsed.data.email.toLowerCase();
+    if (await prisma.user.findUnique({ where: { email } })) {
+      return res.status(409).json({ error: 'EMAIL_IN_USE' });
+    }
+    const passwordHash = await bcrypt.hash(parsed.data.password, 12);
+    const normalizedCode = parsed.data.activationCode?.toUpperCase().replace(/[^A-Z0-9]/gu, '');
+    if (parsed.data.activationCode && normalizedCode?.length !== 12) {
+      return res.status(400).json({ error: 'INVALID_ACTIVATION_CODE' });
+    }
+
+    if (normalizedCode) {
+      const codeHash = crypto.createHmac('sha256', env.JWT_SECRET).update(normalizedCode).digest('hex');
+      const now = new Date();
+      const result = await prisma.$transaction(async tx => {
+        const code = await tx.activationCode.findUnique({ where: { codeHash } });
+        if (!code || code.revokedAt || code.expiresAt && code.expiresAt <= now || code.useCount >= code.maxUses) {
+          return { error: 'INVALID_ACTIVATION_CODE' as const };
+        }
+        const claimed = await tx.activationCode.updateMany({
+          where: { id: code.id, useCount: { lt: 1 }, revokedAt: null, expiresAt: { gt: now } },
+          data: { useCount: { increment: 1 } },
+        });
+        if (claimed.count !== 1) return { error: 'INVALID_ACTIVATION_CODE' as const };
+        const user = await tx.user.create({
+          data: { email, passwordHash, activatedAt: now },
+          select: { id: true, authVersion: true },
+        });
+        await tx.activationCodeRedemption.create({ data: { codeId: code.id, userId: user.id } });
+        return user;
+      });
+      if ('error' in result) return res.status(400).json({ error: result.error });
+      return res.status(201).json({ token: issueToken(result.id, result.authVersion), activated: true });
+    }
+
+    const user = await prisma.user.create({
+      data: { email, passwordHash, activatedAt: null },
+      select: { id: true },
+    });
+    res.status(201).json({ activationRequired: true, activationToken: issueActivationToken(user.id) });`);
+replaceOnce('frontend/src/pages/Login.tsx', `  const [register, setRegister] = useState(() => location.pathname === '/signup');
+  useEffect(() => setRegister(location.pathname === '/signup'), [location.pathname]);`, `  const [register, setRegister] = useState(() => location.pathname === '/signup');
+  const [useActivationCode, setUseActivationCode] = useState(false);
+  const [activationCode, setActivationCode] = useState('');
+  useEffect(() => setRegister(location.pathname === '/signup'), [location.pathname]);`);
+replaceOnce('frontend/src/pages/Login.tsx', `        password,
+        ...(!register ? { deviceId: deviceId() } : {}),`, `        password,
+        ...(register && useActivationCode ? { activationCode: activationCode.trim().toUpperCase() } : {}),
+        ...(!register ? { deviceId: deviceId() } : {}),`);
 replaceOnce('frontend/src/pages/Login.tsx', `      if (data.activationRequired) {
         sessionStorage.setItem('hypercloud-activation-token', data.activationToken);
         nav('/activate');
@@ -54,6 +174,11 @@ replaceOnce('frontend/src/pages/Login.tsx', `      if (data.activationRequired) 
         setMfaChallenge({ id: data.challengeId, method: data.method, frequency: data.frequency, emailHint: data.emailHint });
         setEmailCode('');
         setTotpCode('');
+      } else if (register && useActivationCode && data.token) {
+        clearFastReadCache();
+        localStorage.setItem('token', data.token);
+        setActivationCode('');
+        nav('/files', { replace: true });
       } else if (register || data.activationRequired) {
         sessionStorage.removeItem('hypercloud-activation-token');
         nav('/planes?registro=1', { replace: true });
@@ -62,18 +187,54 @@ replaceOnce('frontend/src/pages/Login.tsx', `      if (data.activationRequired) 
         localStorage.setItem('token', data.token);
         nav('/files');
       }`);
-replaceOnce('frontend/src/pages/Login.tsx', `      clearFastReadCache();
-      localStorage.setItem('token', data.token);
-      nav('/files');
-    } catch (err: any) {`, `      if (register) {
-        sessionStorage.removeItem('hypercloud-activation-token');
-        nav('/planes?registro=1', { replace: true });
-      } else {
-        clearFastReadCache();
-        localStorage.setItem('token', data.token);
-        nav('/files');
-      }
-    } catch (err: any) {`);
+replaceOnce('frontend/src/pages/Login.tsx', `      setError(code === 'ACCOUNT_SUSPENDED'
+        ? 'Esta cuenta está temporalmente suspendida. Contacta al administrador.'`, `      setError(code === 'INVALID_ACTIVATION_CODE'
+        ? 'Código inválido, vencido o ya utilizado.'
+        : code === 'ACCOUNT_SUSPENDED'
+        ? 'Esta cuenta está temporalmente suspendida. Contacta al administrador.'`);
+replaceOnce('frontend/src/pages/Login.tsx', `        /></>}
+        {mfaChallenge && <div className="space-y-3">`, `        />
+        {register && useActivationCode && <label className="mb-3 block text-sm font-medium">Código de activación<input required autoComplete="off" maxLength={12} minLength={12} pattern="[A-Za-z0-9]{12}" value={activationCode} onChange={e => setActivationCode(e.target.value.replace(/[^A-Za-z0-9]/g, '').slice(0, 12).toUpperCase())} placeholder="12 letras y números" className="focus-neon mt-1 w-full rounded-xl bg-white/5 p-3 font-mono uppercase"/></label>}
+        </>}
+        {mfaChallenge && <div className="space-y-3">`);
+replaceOnce('frontend/src/pages/Login.tsx', `        {!mfaChallenge && <button
+          type="button"
+          onClick={() => { const next = !register; setRegister(next); setError(''); setMfaChallenge(null); nav(next ? '/signup' : '/login', { replace: true }); }}
+          className="mt-4 w-full text-vault-muted hover:text-white"
+        >
+          {register ? 'Ya tengo cuenta' : 'Crear usuario'}
+        </button>}`, `        {!mfaChallenge && register && <button type="button" onClick={() => { setUseActivationCode(v => !v); setActivationCode(''); setError(''); }} className="mt-4 w-full rounded-xl border border-vault-primary/30 p-3 text-sm font-semibold text-vault-primary hover:bg-vault-primary/10">{useActivationCode ? 'Crear cuenta con suscripción' : 'Crear con Código de activación'}</button>}
+        {!mfaChallenge && <button
+          type="button"
+          onClick={() => { const next = !register; setRegister(next); setUseActivationCode(false); setActivationCode(''); setError(''); setMfaChallenge(null); nav(next ? '/signup' : '/login', { replace: true }); }}
+          className="mt-4 w-full text-vault-muted hover:text-white"
+        >
+          {register ? 'Ya tengo cuenta' : 'Crear usuario'}
+        </button>}`);
+replaceOnce('frontend/src/pages/AdminPanel.tsx', `  const [quantity, setQuantity] = useState(100);
+  const [maxUses, setMaxUses] = useState(1);
+  const [note, setNote] = useState('');
+  const [expiresAt, setExpiresAt] = useState('');`, `  const [quantity, setQuantity] = useState(100);
+  const [note, setNote] = useState('');`);
+replaceOnce('frontend/src/pages/AdminPanel.tsx', `      const { data } = await adminApi.post('/admin/codes/generate', {
+        quantity, maxUses, note: note || undefined,
+        expiresAt: expiresAt ? new Date(expiresAt).toISOString() : undefined,
+      }, { headers: { Authorization: \`Bearer \${token}\` } });`, `      const { data } = await adminApi.post('/admin/codes/generate', {
+        quantity, note: note || undefined,
+      }, { headers: { Authorization: \`Bearer \${token}\` } });`);
+replaceOnce('frontend/src/pages/AdminPanel.tsx', `              <form onSubmit={generateCodes} className="grid gap-3 sm:grid-cols-2 lg:grid-cols-[.7fr_.7fr_1.2fr_1.2fr_auto]">
+                <label className="text-xs text-vault-muted">Cantidad<input type="number" min={1} max={5000} value={quantity} onChange={e => setQuantity(Math.max(1, Math.min(5000, Number(e.target.value))))} className={\`\${field} mt-1\`}/></label>
+                <label className="text-xs text-vault-muted">Usos por código<input type="number" min={1} max={10000} value={maxUses} onChange={e => setMaxUses(Math.max(1, Math.min(10000, Number(e.target.value))))} className={\`\${field} mt-1\`}/></label>
+                <label className="text-xs text-vault-muted">Nota / lote<input maxLength={300} value={note} onChange={e => setNote(e.target.value)} placeholder="Ej. Lote noviembre" className={\`\${field} mt-1\`}/></label>
+                <label className="text-xs text-vault-muted">Vencimiento (opcional)<input type="datetime-local" value={expiresAt} onChange={e => setExpiresAt(e.target.value)} className={\`\${field} mt-1\`}/></label>
+                <button disabled={busy} className="flex min-h-10 items-center justify-center gap-2 self-end rounded-xl bg-vault-primary px-4 font-bold text-black disabled:opacity-50">{busy ? <LoaderCircle className="animate-spin"/> : <KeyRound size={16}/>}Generar</button>
+              </form>`, `              <p className="mb-3 text-xs text-vault-muted">Cada código contiene 12 caracteres aleatorios, se usa una sola vez y vence a los 5 minutos.</p>
+              <form onSubmit={generateCodes} className="grid gap-3 sm:grid-cols-2 lg:grid-cols-[.7fr_1.2fr_auto]">
+                <label className="text-xs text-vault-muted">Cantidad<input type="number" min={1} max={5000} value={quantity} onChange={e => setQuantity(Math.max(1, Math.min(5000, Number(e.target.value))))} className={\`\${field} mt-1\`}/></label>
+                <label className="text-xs text-vault-muted">Nota / lote<input maxLength={300} value={note} onChange={e => setNote(e.target.value)} placeholder="Ej. Lote noviembre" className={\`\${field} mt-1\`}/></label>
+                <button disabled={busy} className="flex min-h-10 items-center justify-center gap-2 self-end rounded-xl bg-vault-primary px-4 font-bold text-black disabled:opacity-50">{busy ? <LoaderCircle className="animate-spin"/> : <KeyRound size={16}/>}Generar</button>
+              </form>`);
+replaceOnce('frontend/src/pages/AdminPanel.tsx', `c.useCount}/{c.maxUses} usos · {c.note || 'Sin nota'} · vence {c.expiresAt ? new Date(c.expiresAt).toLocaleDateString('es') : 'nunca'}`, `c.useCount}/{c.maxUses} usos · {c.note || 'Sin nota'} · vence {c.expiresAt ? new Date(c.expiresAt).toLocaleString('es') : 'nunca'}`);
 replaceOnce('frontend/src/App.tsx', `const ActivationPage = lazy(() => import('./pages/Activation').then(module => ({ default: module.ActivationPage })));
 `, '');
 replaceOnce('frontend/src/App.tsx', '<Route path="/activate" element={<Page><ActivationPage/></Page>}/>', '<Route path="/activate" element={<Navigate to="/planes" replace/>}/>');
@@ -93,7 +254,7 @@ replaceOnce('frontend/src/pages/Plans.tsx', `        </header>
         )}
 
         <section className="mx-auto mt-12 max-w-3xl text-center sm:mt-16">`);
-console.log('Subscription redirect patch applied');
+console.log('Activation-code signup patch applied');
 NODE
 
 # Release bundles store backend sources at backend/, while workspace builds expect backend/src/.
