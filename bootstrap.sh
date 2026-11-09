@@ -136,3 +136,8 @@ if [ -f hypercloud-app-lock.patch ] && [ "$OVERRIDE_FILE" != "hypercloud-release
   git apply --whitespace=nowarn hypercloud-app-lock.patch
   echo "Optional PIN app lock applied"
 fi
+# Include the latest signed APK in the public Render static-site build.
+if [ -f Hypercloud.apk ]; then
+  mkdir -p frontend/public
+  cp -f Hypercloud.apk frontend/public/Hypercloud.apk
+fi
