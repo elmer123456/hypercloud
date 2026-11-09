@@ -133,3 +133,144 @@
    if (configQ.isError) return (
      <section role="alert" className="glass rounded-2xl border-red-400/20 p-6">
        <h2 className="font-bold text-red-200">No se pudo comprobar la bóveda</h2>
+diff --git a/backend/controllers/projects.ts b/backend/controllers/projects.ts
+index 701c4eb..fdb4e14 100644
+--- a/backend/controllers/projects.ts
++++ b/backend/controllers/projects.ts
+@@ -12,8 +12,8 @@ const projectBody = z.object({
+   status: status.default('IDEA'),
+   repositoryUrl: webUrl,
+   deployUrl: webUrl,
+-  currentFocus: z.string().trim().max(500).default(''),
+-  nextAction: z.string().trim().max(500).default(''),
++  currentFocus: z.string().trim().default(''),
++  nextAction: z.string().trim().default(''),
+ });
+ const updateBody = z.object({
+   id: z.string().uuid().optional(),
+@@ -83,3 +83,23 @@ projectsRouter.post('/:id/updates', async (req, res, next) => {
+     res.status(201).json(update);
+   } catch (e) { next(e); }
+ });
++
++projectsRouter.delete('/:id/updates/:updateId', async (req, res, next) => {
++  try {
++    if (!idSchema.safeParse(req.params.id).success || !idSchema.safeParse(req.params.updateId).success) {
++      return res.status(404).json({ error: 'NOT_FOUND' });
++    }
++    const project = await prisma.project.findFirst({
++      where: { id: req.params.id, userId: req.userId! },
++      select: { id: true },
++    });
++    if (!project) return res.status(404).json({ error: 'NOT_FOUND' });
++    const removed = await prisma.projectUpdate.deleteMany({
++      where: { id: req.params.updateId, projectId: project.id },
++    });
++    if (removed.count) {
++      await prisma.project.update({ where: { id: project.id }, data: { updatedAt: new Date() } });
++    }
++    res.status(204).end();
++  } catch (e) { next(e); }
++});
+diff --git a/backend/prisma/migrations/20261102000000_project_context_text/migration.sql b/backend/prisma/migrations/20261102000000_project_context_text/migration.sql
+new file mode 100644
+index 0000000..ba667f9
+--- /dev/null
++++ b/backend/prisma/migrations/20261102000000_project_context_text/migration.sql
+@@ -0,0 +1,3 @@
++ALTER TABLE "Project"
++  ALTER COLUMN "currentFocus" TYPE TEXT,
++  ALTER COLUMN "nextAction" TYPE TEXT;
+diff --git a/backend/prisma/schema.prisma b/backend/prisma/schema.prisma
+index b73c745..24c0fc4 100644
+--- a/backend/prisma/schema.prisma
++++ b/backend/prisma/schema.prisma
+@@ -294,8 +294,8 @@ model Project {
+   status ProjectStatus @default(IDEA)
+   repositoryUrl String? @db.VarChar(500)
+   deployUrl String? @db.VarChar(500)
+-  currentFocus String @default("") @db.VarChar(500)
+-  nextAction String @default("") @db.VarChar(500)
++  currentFocus String @default("")
++  nextAction String @default("")
+   createdAt DateTime @default(now())
+   updatedAt DateTime @updatedAt
+   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+diff --git a/frontend/src/lib/offlineProjects.ts b/frontend/src/lib/offlineProjects.ts
+index 5a8e651..24c41ad 100644
+--- a/frontend/src/lib/offlineProjects.ts
++++ b/frontend/src/lib/offlineProjects.ts
+@@ -5,7 +5,8 @@ import { Network } from '@capacitor/network';
+ export type OfflineProjectOperation =
+   | { kind: 'create'; projectId: string; data: Record<string, unknown> }
+   | { kind: 'update'; projectId: string; baseUpdatedAt: string | null; data: Record<string, unknown> }
+-  | { kind: 'addUpdate'; projectId: string; updateId: string; data: Record<string, unknown> };
++  | { kind: 'addUpdate'; projectId: string; updateId: string; data: Record<string, unknown> }
++  | { kind: 'deleteUpdate'; projectId: string; updateId: string };
+ 
+ export type OfflineProjectState = {
+   projects: any[];
+@@ -311,9 +312,12 @@ export async function syncOfflineProjectQueue(key: CryptoKey): Promise<{ pending
+               state.lastSyncedAt[operation.projectId] = updated.updatedAt;
+             }
+           }
+-        } else {
++        } else if (operation.kind === 'addUpdate') {
+           const targetId = state.conflictTargets[operation.projectId] || operation.projectId;
+           await api.post(`/projects/${targetId}/updates`, { ...operation.data, id: operation.updateId }, { timeout: 2500 });
++        } else {
++          const targetId = state.conflictTargets[operation.projectId] || operation.projectId;
++          await api.delete(`/projects/${targetId}/updates/${operation.updateId}`, { timeout: 2500 });
+         }
+         state.queue = state.queue.filter(item => item !== operation);
+         synced += 1;
+diff --git a/frontend/src/pages/Landing.tsx b/frontend/src/pages/Landing.tsx
+index 035cbab..f6f1fc3 100644
+--- a/frontend/src/pages/Landing.tsx
++++ b/frontend/src/pages/Landing.tsx
+@@ -2,6 +2,7 @@ import { motion } from 'framer-motion';
+ import {
+   ArrowRight,
+   Cloud,
++  Download,
+   FolderKanban,
+   HardDrive,
+   KeyRound,
+@@ -95,6 +96,9 @@ export function LandingPage() {
+               <Link to="/login" className="landing-secondary-action inline-flex min-h-12 items-center justify-center rounded-xl px-5 py-3 font-semibold">
+                 Ya tengo cuenta
+               </Link>
++              <a href="/Hypercloud.apk" className="landing-secondary-action inline-flex min-h-12 items-center justify-center gap-2 rounded-xl px-5 py-3 font-semibold">
++                <Download size={17} aria-hidden="true" /> Descargar APK Android
++              </a>
+             </div>
+             <div className="mt-8 flex flex-wrap gap-x-5 gap-y-2 text-xs text-white/55 sm:text-sm">
+               <span className="inline-flex items-center gap-2"><ShieldCheck size={16} className="text-emerald-300" /> PIN y 2FA</span>
+diff --git a/frontend/src/pages/Projects.tsx b/frontend/src/pages/Projects.tsx
+index a2f2df9..12a28b8 100644
+--- a/frontend/src/pages/Projects.tsx
++++ b/frontend/src/pages/Projects.tsx
+@@ -49,6 +49,7 @@ export function ProjectsPage(){
+  async function startSync(){if(!offlineProjectKey||!(await canSyncProjectQueueOnWifi())||!sessionStorage.getItem('hypercloud-pin-token'))return;const result=await syncOfflineProjectQueue(offlineProjectKey);if(result.synced){const state=await readOfflineProjectState(offlineProjectKey);if(state){setOfflineState(state);qc.setQueryData(['projects'],state.projects);}void qc.invalidateQueries({queryKey:['projects']});}}
+  async function saveProject(e:React.FormEvent){e.preventDefault();setBusy(true);setError('');try{const payload={...form,repositoryUrl:form.repositoryUrl?.trim()||null,deployUrl:form.deployUrl?.trim()||null};if(!offlineProjectKey){throw new Error('No se pudo abrir el almacenamiento cifrado local. Vuelve a introducir tu PIN con conexión.');}const state=(await readOfflineProjectState(offlineProjectKey))||{projects:[],details:{},queue:[],conflictTargets:{},lastSyncedAt:{},savedAt:Date.now()};const now=new Date().toISOString();let projectId=editingId;let baseUpdatedAt:string|null=null;if(editingId){const prior=state.details[editingId]||projects.find(p=>p.id===editingId);baseUpdatedAt=state.lastSyncedAt[editingId]||prior?.updatedAt||null;const nextProject={...prior,...payload,updatedAt:now};state.details[editingId]=nextProject;state.projects=state.projects.map(p=>p.id===editingId?{...p,...nextProject}:p);const pending=state.queue.find(op=>op.kind==='update'&&op.projectId===editingId) as Extract<OfflineProjectOperation,{kind:'update'}>|undefined;if(pending)pending.data=payload;else state.queue.push({kind:'update',projectId:editingId,baseUpdatedAt,data:payload});qc.setQueryData(['project',editingId],nextProject);}else{projectId=crypto.randomUUID();const nextProject:Project={id:projectId,...payload,updatedAt:now,_count:{updates:0},updates:[]};state.projects=[nextProject,...state.projects];state.details[projectId]=nextProject;state.queue.push({kind:'create',projectId,data:payload});qc.setQueryData(['project',projectId],nextProject);setSelectedId(projectId);}await persistState(state);qc.setQueryData(['projects'],state.projects);setEditOpen(false);setError('');setBusy(false);void startSync();}catch(err:any){setError(err?.message||'No se pudo guardar el proyecto en este dispositivo.');setBusy(false);}}
+  async function addUpdate(e:React.FormEvent){e.preventDefault();if(!selectedId||!updateTitle.trim())return;setBusy(true);setError('');try{if(!offlineProjectKey)throw new Error('No se pudo abrir el almacenamiento cifrado local.');const state=(await readOfflineProjectState(offlineProjectKey))||{projects:[],details:{},queue:[],conflictTargets:{},lastSyncedAt:{},savedAt:Date.now()};const updateId=crypto.randomUUID(),now=new Date().toISOString(),payload={type:updateType,title:updateTitle.trim(),body:updateBody.trim()},detail=state.details[selectedId]||selected||projects.find(p=>p.id===selectedId);if(!detail)throw new Error('No se encontró la copia local del proyecto.');const nextDetail={...detail,updates:[{id:updateId,...payload,createdAt:now},...(detail.updates||[])],updatedAt:now,_count:{updates:(detail._count?.updates||0)+1}};state.details[selectedId]=nextDetail;state.projects=state.projects.map(p=>p.id===selectedId?{...p,...nextDetail}:p);state.queue.push({kind:'addUpdate',projectId:selectedId,updateId,data:payload});await persistState(state);qc.setQueryData(['project',selectedId],nextDetail);qc.setQueryData(['projects'],state.projects);setUpdateTitle('');setUpdateBody('');setBusy(false);void startSync();}catch(err:any){setError(err?.message||'No se pudo guardar el avance localmente.');setBusy(false);}}
++ async function deleteUpdate(update:Update){if(!selectedId||!offlineProjectKey||busy)return;if(!confirm(`¿Eliminar «${update.title}» de la bitácora? Esta acción no se puede deshacer.`))return;setBusy(true);setError('');try{const state=(await readOfflineProjectState(offlineProjectKey))||{projects:[],details:{},queue:[],conflictTargets:{},lastSyncedAt:{},savedAt:Date.now()};const detail=state.details[selectedId]||selected||projects.find(p=>p.id===selectedId);if(!detail)throw new Error('No se encontró la copia local del proyecto.');const nextDetail={...detail,updates:(detail.updates||[]).filter((item:Update)=>item.id!==update.id),updatedAt:new Date().toISOString(),_count:{updates:Math.max(0,(detail._count?.updates||0)-1)}};state.details[selectedId]=nextDetail;state.projects=state.projects.map(p=>p.id===selectedId?{...p,...nextDetail}:p);const pendingAdd=state.queue.some(op=>op.kind==='addUpdate'&&op.projectId===selectedId&&op.updateId===update.id);state.queue=state.queue.filter(op=>!(op.kind==='addUpdate'&&op.projectId===selectedId&&op.updateId===update.id));if(!pendingAdd)state.queue.push({kind:'deleteUpdate',projectId:selectedId,updateId:update.id});await persistState(state);qc.setQueryData(['project',selectedId],nextDetail);qc.setQueryData(['projects'],state.projects);setBusy(false);void startSync();}catch(err:any){setError(err?.message||'No se pudo eliminar la entrada.');setBusy(false);}}
+  async function deleteProject(p:Project){if(!online){setError('La eliminación requiere conexión. Los cambios sin conexión se conservan hasta sincronizarse.');return;}if(!confirm(`¿Eliminar el proyecto «${p.name}» y su historial? Los accesos relacionados quedarán sin proyecto.`))return;await api.delete(`/projects/${p.id}`);if(offlineProjectKey){const state=(await readOfflineProjectState(offlineProjectKey))||{projects:[],details:{},queue:[],conflictTargets:{},lastSyncedAt:{},savedAt:Date.now()};state.projects=state.projects.filter(item=>item.id!==p.id);delete state.details[p.id];await persistState(state);}if(selectedId===p.id)setSelectedId('');await qc.invalidateQueries({queryKey:['projects']});}
+  if(!cacheReady||listQ.isLoading)return <div role="status" className="glass rounded-2xl p-6 text-sm text-vault-muted"><span className="mr-2 inline-block h-3 w-3 animate-spin rounded-full border-2 border-white/20 border-t-vault-primary align-[-2px]"/>Abriendo tus proyectos…</div>;
+  if(listQ.isError&&!listQ.data)return <section role="alert" className="glass rounded-2xl border-red-400/20 p-6"><h2 className="font-bold text-red-200">No se pudo abrir una copia de Proyectos</h2><p className="mt-2 text-sm text-vault-muted">Conéctate para cargar los datos por primera vez. Después estarán disponibles sin conexión.</p><button type="button" onClick={()=>void listQ.refetch()} className="mt-4 rounded-xl border border-white/10 px-4 py-2 text-sm hover:border-vault-primary">Reintentar</button></section>;
+@@ -61,12 +62,12 @@ export function ProjectsPage(){
+   {!selectedId&&projects.length>0&&<section className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">{projects.map(p=><button key={p.id} onClick={()=>setSelectedId(p.id)} className="glass rounded-2xl p-4 text-left transition hover:border-vault-primary/60 hover:shadow-neon"><div className="flex items-start justify-between gap-2"><h2 className="font-bold">{p.name}</h2><span className={`rounded-full px-2 py-1 text-[10px] ${statusStyle[p.status]}`}>{statuses[p.status]}</span></div><p className="mt-2 line-clamp-2 min-h-10 text-sm text-vault-muted">{p.summary||'Agrega una descripción breve para recordar el objetivo.'}</p><div className="mt-4 grid gap-1 text-xs text-vault-muted"><span>Enfoque: {p.currentFocus||'—'}</span><span>Siguiente: {p.nextAction||'—'}</span></div><div className="mt-4 flex items-center justify-between border-t border-white/10 pt-3 text-xs"><span className="text-vault-primary">{p._count?.updates||0} actualizaciones</span><span className="text-vault-muted">Actualizado {date(p.updatedAt)}</span></div></button>)}</section>}
+   {selectedId&&<section className="space-y-4">{detailQ.isLoading?<p role="status" className="text-sm text-vault-muted">Abriendo la copia guardada…</p>:detailQ.isError&&!detailQ.data?<div role="alert" className="rounded-xl border border-red-400/20 p-4 text-sm text-red-200">No se pudo cargar este detalle. <button type="button" onClick={()=>void detailQ.refetch()} className="ml-1 underline">Reintentar</button></div>:!selected?<p className="text-sm text-vault-muted">Este detalle aún no se guardó en el dispositivo; vuelve a conectarte para cargarlo una vez.</p>:<><div className="flex flex-wrap items-center justify-between gap-3"><button onClick={()=>setSelectedId('')} className="flex items-center gap-1 text-sm text-vault-muted hover:text-white"><ArrowLeft size={16}/>Todos los proyectos</button><div className="flex gap-2"><button onClick={()=>beginEdit(selected)} className="flex items-center gap-2 rounded-xl border border-white/10 px-3 py-2 text-sm hover:border-vault-primary"><Pencil size={15}/>Editar</button><button onClick={()=>void deleteProject(selected)} className="rounded-xl border border-white/10 p-2 text-vault-muted hover:text-red-300" aria-label="Eliminar proyecto"><Trash2 size={16}/></button></div></div>
+     <div className="glass rounded-2xl p-5 sm:p-6"><div className="flex flex-wrap items-start justify-between gap-3"><div><h2 className="text-2xl font-black">{selected.name}</h2><p className="mt-2 max-w-3xl whitespace-pre-wrap text-sm text-vault-muted">{selected.summary||'Sin descripción todavía.'}</p></div><span className={`rounded-full px-3 py-1.5 text-xs ${statusStyle[selected.status]}`}>{statuses[selected.status]}</span></div>
+-     <div className="mt-5 grid gap-3 sm:grid-cols-2"><div className="rounded-xl bg-white/5 p-3"><small className="text-vault-muted">Enfoque ahora</small><p className="mt-1 text-sm">{selected.currentFocus||'—'}</p></div><div className="rounded-xl bg-vault-primary/5 p-3"><small className="text-vault-primary">Siguiente paso</small><p className="mt-1 text-sm">{selected.nextAction||'—'}</p></div></div>
++     <div className="mt-5 grid gap-3 sm:grid-cols-2"><div className="rounded-xl bg-white/5 p-3"><small className="text-vault-muted">Enfoque ahora</small><p className="mt-1 whitespace-pre-wrap break-words text-sm">{selected.currentFocus||'—'}</p></div><div className="rounded-xl bg-vault-primary/5 p-3"><small className="text-vault-primary">Siguiente paso</small><p className="mt-1 whitespace-pre-wrap break-words text-sm">{selected.nextAction||'—'}</p></div></div>
+      <div className="mt-4 flex flex-wrap gap-2">{selected.repositoryUrl&&<a href={selected.repositoryUrl} target="_blank" rel="noreferrer" className="flex items-center gap-1 rounded-lg border border-white/10 px-3 py-2 text-xs text-vault-primary hover:border-vault-primary"><Link2 size={14}/>Repositorio<ExternalLink size={12}/></a>}{selected.deployUrl&&<a href={selected.deployUrl} target="_blank" rel="noreferrer" className="flex items-center gap-1 rounded-lg border border-white/10 px-3 py-2 text-xs text-vault-primary hover:border-vault-primary"><Rocket size={14}/>App publicada<ExternalLink size={12}/></a>}</div></div>
+-    <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(280px,.8fr)]"><section className="glass rounded-2xl p-4 sm:p-5"><h3 className="font-bold">Bitácora del proyecto</h3><p className="mt-1 text-xs text-vault-muted">Guarda qué cambiaste, qué falló y qué quedó desplegado.</p><div className="mt-4 space-y-3">{selected.updates?.length?selected.updates.map(u=>{const meta=updateTypes[u.type]||updateTypes.NOTE,Icon=meta.icon;return <article key={u.id} className="flex gap-3 border-l border-white/10 pl-3"><Icon size={16} className={`mt-0.5 shrink-0 ${meta.color}`}/><div className="min-w-0"><div className="flex flex-wrap items-center gap-2"><b className="text-sm">{u.title}</b><span className="rounded-full bg-white/5 px-2 py-0.5 text-[10px] text-vault-muted">{meta.label}</span></div>{u.body&&<p className="mt-1 whitespace-pre-wrap text-sm text-vault-muted">{u.body}</p>}<small className="mt-1 block text-[10px] text-white/40">{date(u.createdAt)}</small></div></article>;}):<p className="rounded-xl bg-white/5 p-3 text-sm text-vault-muted">Aún no hay movimientos. Anota la primera idea o mejora.</p>}</div></section>
++    <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(280px,.8fr)]"><section className="glass rounded-2xl p-4 sm:p-5"><h3 className="font-bold">Bitácora del proyecto</h3><p className="mt-1 text-xs text-vault-muted">Guarda qué cambiaste, qué falló y qué quedó desplegado.</p><div className="mt-4 space-y-3">{selected.updates?.length?selected.updates.map(u=>{const meta=updateTypes[u.type]||updateTypes.NOTE,Icon=meta.icon;return <article key={u.id} className="flex gap-3 border-l border-white/10 pl-3"><Icon size={16} className={`mt-0.5 shrink-0 ${meta.color}`}/><div className="min-w-0 flex-1"><div className="flex flex-wrap items-start justify-between gap-2"><div className="flex flex-wrap items-center gap-2"><b className="text-sm">{u.title}</b><span className="rounded-full bg-white/5 px-2 py-0.5 text-[10px] text-vault-muted">{meta.label}</span></div><button type="button" onClick={()=>void deleteUpdate(u)} disabled={busy} aria-label={`Eliminar ${u.title}`} title="Eliminar entrada" className="rounded-lg p-1 text-vault-muted hover:bg-red-400/10 hover:text-red-300 disabled:opacity-40"><Trash2 size={14}/></button></div>{u.body&&<p className="mt-1 whitespace-pre-wrap break-words text-sm text-vault-muted">{u.body}</p>}<small className="mt-1 block text-[10px] text-white/40">{date(u.createdAt)}</small></div></article>;}):<p className="rounded-xl bg-white/5 p-3 text-sm text-vault-muted">Aún no hay movimientos. Anota la primera idea o mejora.</p>}</div></section>
+      <form onSubmit={addUpdate} className="glass h-fit rounded-2xl p-4 sm:p-5"><h3 className="font-bold">Registrar avance</h3><label className="mt-3 block text-xs text-vault-muted">Tipo<select value={updateType} onChange={e=>setUpdateType(e.target.value as Update['type'])} className={`${field} mt-1`}>{Object.entries(updateTypes).map(([k,v])=><option key={k} value={k} className="bg-black">{v.label}</option>)}</select></label><label className="mt-3 block text-xs text-vault-muted">Qué pasó<input required maxLength={160} value={updateTitle} onChange={e=>setUpdateTitle(e.target.value)} placeholder="Ej. Login de GitHub listo" className={`${field} mt-1`}/></label><label className="mt-3 block text-xs text-vault-muted">Detalle / resultado<StableTextarea rows={4} maxLength={10000} value={updateBody} onChange={e=>setUpdateBody(e.target.value)} placeholder="Qué probaste, resultado y qué sigue" className={`${field} mt-1 min-h-24 resize-none overflow-y-auto`}/></label>{error&&<p className="mt-2 text-sm text-red-300">{error}</p>}<button disabled={busy||!updateTitle.trim()} className="mt-3 flex min-h-10 w-full items-center justify-center gap-2 rounded-xl bg-vault-primary font-bold text-black disabled:opacity-50"><Save size={15}/>Guardar avance</button></form></div>
+   </>}</section>}
+   {error&&!selectedId&&<p className="text-sm text-red-300">{error}</p>}
+-  <Dialog open={editOpen} onClose={setEditOpen} className="relative z-50"><div className="fixed inset-0 bg-black/80"/><div className="fixed inset-0 grid items-start justify-items-center overflow-y-auto overscroll-contain p-4"><DialogPanel className="glass my-0 max-h-[calc(100dvh-2rem)] w-full max-w-xl overflow-y-auto overscroll-contain rounded-2xl p-5 sm:p-6"><h2 className="text-xl font-bold">{editingId?'Editar proyecto':'Nuevo proyecto'}</h2><form onSubmit={saveProject} className="mt-4 space-y-3"><label className="block text-xs text-vault-muted">Nombre *<input required maxLength={120} value={form.name} onChange={e=>setForm(f=>({...f,name:e.target.value}))} placeholder="Hypercloud" className={`${field} mt-1`}/></label><label className="block text-xs text-vault-muted">Objetivo / descripción<StableTextarea rows={3} maxLength={5000} value={form.summary} onChange={e=>setForm(f=>({...f,summary:e.target.value}))} placeholder="Qué resuelve, para quién y cómo se verá terminado" className={`${field} mt-1 min-h-24 resize-none overflow-y-auto`}/></label><label className="block text-xs text-vault-muted">Estado<select value={form.status} onChange={e=>setForm(f=>({...f,status:e.target.value as Project['status']}))} className={`${field} mt-1`}>{Object.entries(statuses).map(([k,v])=><option key={k} value={k} className="bg-black">{v}</option>)}</select></label><div className="grid gap-3 sm:grid-cols-2"><label className="block text-xs text-vault-muted">Repositorio URL<input type="url" maxLength={500} value={form.repositoryUrl||''} onChange={e=>setForm(f=>({...f,repositoryUrl:e.target.value}))} placeholder="https://github.com/…" className={`${field} mt-1`}/></label><label className="block text-xs text-vault-muted">App publicada<input type="url" maxLength={500} value={form.deployUrl||''} onChange={e=>setForm(f=>({...f,deployUrl:e.target.value}))} placeholder="https://…" className={`${field} mt-1`}/></label></div><label className="block text-xs text-vault-muted">En qué estás trabajando<input maxLength={500} value={form.currentFocus} onChange={e=>setForm(f=>({...f,currentFocus:e.target.value}))} placeholder="Mejorar la biblioteca y los filtros" className={`${field} mt-1`}/></label><label className="block text-xs text-vault-muted">Próxima acción concreta<input maxLength={500} value={form.nextAction} onChange={e=>setForm(f=>({...f,nextAction:e.target.value}))} placeholder="Probar subida de carpeta en Android" className={`${field} mt-1`}/></label>{error&&<p className="text-sm text-red-300">{error}</p>}<button disabled={busy} className="flex min-h-11 w-full items-center justify-center gap-2 rounded-xl bg-vault-primary font-bold text-black disabled:opacity-50"><Save size={15}/>{busy?'Guardando…':'Guardar proyecto'}</button></form></DialogPanel></div></Dialog>
++  <Dialog open={editOpen} onClose={setEditOpen} className="relative z-50"><div className="fixed inset-0 bg-black/80"/><div className="fixed inset-0 grid items-start justify-items-center overflow-y-auto overscroll-contain p-4"><DialogPanel className="glass my-0 max-h-[calc(100dvh-2rem)] w-full max-w-xl overflow-y-auto overscroll-contain rounded-2xl p-5 sm:p-6"><h2 className="text-xl font-bold">{editingId?'Editar proyecto':'Nuevo proyecto'}</h2><form onSubmit={saveProject} className="mt-4 space-y-3"><label className="block text-xs text-vault-muted">Nombre *<input required maxLength={120} value={form.name} onChange={e=>setForm(f=>({...f,name:e.target.value}))} placeholder="Hypercloud" className={`${field} mt-1`}/></label><label className="block text-xs text-vault-muted">Objetivo / descripción<StableTextarea rows={3} maxLength={5000} value={form.summary} onChange={e=>setForm(f=>({...f,summary:e.target.value}))} placeholder="Qué resuelve, para quién y cómo se verá terminado" className={`${field} mt-1 min-h-24 resize-none overflow-y-auto`}/></label><label className="block text-xs text-vault-muted">Estado<select value={form.status} onChange={e=>setForm(f=>({...f,status:e.target.value as Project['status']}))} className={`${field} mt-1`}>{Object.entries(statuses).map(([k,v])=><option key={k} value={k} className="bg-black">{v}</option>)}</select></label><div className="grid gap-3 sm:grid-cols-2"><label className="block text-xs text-vault-muted">Repositorio URL<input type="url" maxLength={500} value={form.repositoryUrl||''} onChange={e=>setForm(f=>({...f,repositoryUrl:e.target.value}))} placeholder="https://github.com/…" className={`${field} mt-1`}/></label><label className="block text-xs text-vault-muted">App publicada<input type="url" maxLength={500} value={form.deployUrl||''} onChange={e=>setForm(f=>({...f,deployUrl:e.target.value}))} placeholder="https://…" className={`${field} mt-1`}/></label></div><label className="block text-xs text-vault-muted">En qué estás trabajando<StableTextarea rows={5} value={form.currentFocus} onChange={e=>setForm(f=>({...f,currentFocus:e.target.value}))} placeholder="Describe con todo el detalle que necesites en qué estás trabajando" className={`${field} mt-1 min-h-32 resize-y whitespace-pre-wrap`}/></label><label className="block text-xs text-vault-muted">Próxima acción concreta<StableTextarea rows={5} value={form.nextAction} onChange={e=>setForm(f=>({...f,nextAction:e.target.value}))} placeholder="Escribe la próxima acción concreta y el contexto que haga falta" className={`${field} mt-1 min-h-32 resize-y whitespace-pre-wrap`}/></label>{error&&<p className="text-sm text-red-300">{error}</p>}<button disabled={busy} className="flex min-h-11 w-full items-center justify-center gap-2 rounded-xl bg-vault-primary font-bold text-black disabled:opacity-50"><Save size={15}/>{busy?'Guardando…':'Guardar proyecto'}</button></form></DialogPanel></div></Dialog>
+  </div>;
+ }
