@@ -1,6 +1,8 @@
 name: Build Hyper Cloud Android APK
 
 
+
+
 on:
   workflow_dispatch:
   push:
@@ -12,10 +14,15 @@ on:
       - 'hypercloud-release-20261026-mfa-share.b64'
       - 'bootstrap.sh'
       - '.github/workflows/build-android.yml'
+      - 'hypercloud-vault-startup-retry.patch'
+
+
 
 
 permissions:
-  contents: read
+  contents: write
+
+
 
 
 jobs:
@@ -27,10 +34,14 @@ jobs:
         uses: actions/checkout@v4
 
 
+
+
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 20
+
+
 
 
       - name: Set up Java
@@ -40,18 +51,26 @@ jobs:
           java-version: '17'
 
 
+
+
       - name: Install Android SDK
         uses: android-actions/setup-android@v3
         with:
           packages: 'platform-tools platforms;android-34 build-tools;34.0.0'
 
 
+
+
       - name: Reconstruct the app source
         run: bash bootstrap.sh
 
 
+
+
       - name: Install dependencies
         run: npm ci --include=dev
+
+
 
 
       - name: Build bundled app assets
@@ -60,12 +79,16 @@ jobs:
           VITE_API_URL: https://drime-multi-vault-api.onrender.com/api
 
 
+
+
       - name: Generate native Android project
         working-directory: frontend
         run: |
           npx cap add android
           npx cap sync android
           node scripts/patch-android-manifest.mjs
+
+
 
 
       - name: Install Hyper Cloud launcher icons
@@ -105,6 +128,8 @@ jobs:
           xml = xml.replace(appTag[0], updated);
           fs.writeFileSync(file, xml);
           NODE
+
+
 
 
       - name: Configure persistent release signing and version
@@ -153,9 +178,13 @@ jobs:
           NODE
 
 
+
+
       - name: Build installable APK
         working-directory: frontend/android
         run: chmod +x gradlew && ./gradlew --no-daemon assembleRelease
+
+
 
 
       - name: Publish APK artifact
@@ -165,3 +194,20 @@ jobs:
           path: frontend/android/app/build/outputs/apk/release/app-release.apk
           if-no-files-found: error
           retention-days: 30
+
+      - name: Publish latest signed APK to Render
+        if: github.ref == 'refs/heads/main'
+        run: |
+          set -euo pipefail
+          cp frontend/android/app/build/outputs/apk/release/app-release.apk Hypercloud.apk
+          git fetch origin "$GITHUB_REF_NAME"
+          git rebase "origin/$GITHUB_REF_NAME"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Hypercloud.apk
+          if git diff --cached --quiet; then
+            echo 'The latest APK is already published.'
+            exit 0
+          fi
+          git commit -m 'Publish latest signed Hypercloud APK'
+          git push origin "HEAD:${GITHUB_REF_NAME}"
