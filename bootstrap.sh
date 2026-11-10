@@ -381,4 +381,11 @@ if (fs.existsSync(file)) {
     fs.writeFileSync(file, source);
   }
 }
+const htmlFile = 'frontend/index.html';
+if (fs.existsSync(htmlFile)) {
+  const html = fs.readFileSync(htmlFile, 'utf8');
+  const titled = html.replace(/<title>[^<]*<\/title>/i, '<title>Hypercloud</title>');
+  if (!/<title>[^<]*<\/title>/i.test(html)) throw new Error('HTML title tag not found');
+  if (html !== titled) fs.writeFileSync(htmlFile, titled);
+}
 NODE
