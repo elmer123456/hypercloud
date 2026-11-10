@@ -368,3 +368,17 @@ if [ -f Hypercloud.apk ]; then
   mkdir -p frontend/public
   cp -f Hypercloud.apk frontend/public/Hypercloud.apk
 fi
+# Make the existing landing-page APK button download the file directly.
+node <<'NODE'
+const fs = require('node:fs');
+const file = 'frontend/src/pages/Landing.tsx';
+if (fs.existsSync(file)) {
+  let source = fs.readFileSync(file, 'utf8');
+  const marker = '<a href="/Hypercloud.apk"';
+  if (!source.includes(marker)) throw new Error('Landing APK link not found');
+  if (!source.includes('download="Hypercloud.apk"')) {
+    source = source.replace(marker, `${marker} download="Hypercloud.apk"`);
+    fs.writeFileSync(file, source);
+  }
+}
+NODE
