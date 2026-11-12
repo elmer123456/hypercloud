@@ -15,9 +15,11 @@ const actionCallNew = '<PlanAction href={plan.href} action={plan.action} trial={
 if (!source.includes(actionCall)) throw new Error('PlanAction invocation not found');
 source = source.replace(actionCall, actionCallNew);
 const oldCopy = 'Los enlaces de Mercado Pago abren el checkout de cada plan. El importe y la moneda serán los configurados en ese enlace; un enlace único no cambia automáticamente a la moneda local de cada país. En esta modalidad, los pagos y la activación del plan se verifican manualmente; Hypercloud no actualiza automáticamente los límites de cuentas.';
-const newCopy = 'Mercado Pago conserva sus enlaces actuales. ATLOS acepta pagos cripto internacionales con suscripción mensual en USD; la recurrencia la administra ATLOS. Por ahora, Hypercloud verifica manualmente los pagos y activa el plan; conserva el correo de confirmación de ATLOS.';
-if (!source.includes(oldCopy)) throw new Error('Plan payment disclosure not found');
-source = source.replace(oldCopy, newCopy);
+const currentCopy = 'Los enlaces de Mercado Pago abren el checkout de cada plan. El importe y la moneda serán los configurados en ese enlace; un enlace único no cambia automáticamente a la moneda local de cada país. El pago y la asignación del plan se verifican manualmente antes de aumentar el límite. Las cuotas de cada proveedor siguen aplicando; el espacio se agrega solo dentro de tu cuenta, no se comparte entre usuarios.';
+const newCopy = 'Mercado Pago conserva sus enlaces actuales. ATLOS acepta pagos cripto internacionales con suscripción mensual en USD; la recurrencia la administra ATLOS. Hypercloud verifica manualmente el pago y asigna el plan; las cuotas y condiciones de cada proveedor siguen aplicando, y el espacio se agrega solo dentro de tu cuenta, no se comparte entre usuarios.';
+if (source.includes(oldCopy)) source = source.replace(oldCopy, newCopy);
+else if (source.includes(currentCopy)) source = source.replace(currentCopy, newCopy);
+else throw new Error('Plan payment disclosure not found');
 fs.writeFileSync(file, source);
 const htmlFile = 'frontend/index.html';
 let html = fs.readFileSync(htmlFile, 'utf8');
@@ -28,3 +30,4 @@ if (!html.includes(script)) {
   fs.writeFileSync(htmlFile, html);
 }
 console.log('ATLOS monthly crypto checkout patch applied');
+
