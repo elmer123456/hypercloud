@@ -1,0 +1,122 @@
+--- a/backend/src/services/accountLimits.ts
++++ b/backend/src/services/accountLimits.ts
+@@ -12,6 +12,15 @@
+ type AccountCreateData = Omit<Prisma.DrimeAccountUncheckedCreateInput, 'userId' | 'provider' | 'email'>;
+ type AccountUpdateData = Prisma.DrimeAccountUpdateInput;
+ 
++// Sync jobs can revisit the same users thousands of times. Cache only the
++// eligible account IDs; connection creation still checks the limit in SQL.
++// A plan downgrade takes effect in the worker within at most 30 seconds.
++const PLAN_CACHE_TTL_MS = 30_000;
++const planEligibilityCache = new Map<string, {
++  expiresAt: number;
++  promise: Promise<Set<string> | null>;
++}>();
++
+ /** Serialize connections per user to prevent parallel requests exceeding the plan limit. */
+ export async function upsertConnectedAccount(input: {
+   userId: string;
+@@ -58,14 +67,35 @@
+ 
+ /** Only the oldest accounts within the assigned tier may run sync jobs after a downgrade. */
+ export async function isAccountWithinPlan(userId: string, accountId: string) {
+-  const user = await prisma.user.findUnique({ where: { id: userId }, select: { accountLimit: true } });
+-  if (!user) return false;
+-  if (user.accountLimit === null) return true;
+-  const allowed = await prisma.drimeAccount.findMany({
+-    where: { userId },
+-    orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+-    take: user.accountLimit,
+-    select: { id: true },
+-  });
+-  return allowed.some(account => account.id === accountId);
++  const now = Date.now();
++  let cached = planEligibilityCache.get(userId);
++  if (!cached || cached.expiresAt <= now) {
++    if (planEligibilityCache.size > 5_000) {
++      for (const [key, value] of planEligibilityCache) {
++        if (value.expiresAt <= now) planEligibilityCache.delete(key);
++      }
++    }
++    const promise = (async () => {
++      const user = await prisma.user.findUnique({ where: { id: userId }, select: { accountLimit: true } });
++      if (!user) return new Set<string>();
++      if (user.accountLimit === null) return null;
++      const allowed = await prisma.drimeAccount.findMany({
++        where: { userId },
++        orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
++        take: user.accountLimit,
++        select: { id: true },
++      });
++      return new Set(allowed.map(account => account.id));
++    })();
++    cached = { expiresAt: now + PLAN_CACHE_TTL_MS, promise };
++    planEligibilityCache.set(userId, cached);
++  }
++
++  try {
++    const allowed = await cached.promise;
++    return allowed === null || allowed.has(accountId);
++  } catch (error) {
++    if (planEligibilityCache.get(userId) === cached) planEligibilityCache.delete(userId);
++    throw error;
++  }
+ }
+--- a/backend/src/workers/index.ts
++++ b/backend/src/workers/index.ts
+@@ -6,9 +6,22 @@
+ 
+ const configuredInterval = (value: string | undefined, fallback: number, minimum: number) =>
+   Math.max(minimum, Number(value) || fallback);
+-const QUICK_MS = configuredInterval(process.env.QUICK_SYNC_MS, 5 * 60_000, 60_000);
+-const FULL_MS = configuredInterval(process.env.SYNC_INTERVAL_MS, 24 * 60 * 60_000, 60 * 60_000);
++// LOW_COST_MODE reduces background provider/API and database traffic. It does
++// not remove the need for PostgreSQL or Redis; users can still sync on demand.
++const LOW_COST_MODE = process.env.LOW_COST_MODE === 'true';
++const QUICK_MS = configuredInterval(
++  process.env.QUICK_SYNC_MS,
++  LOW_COST_MODE ? 60 * 60_000 : 5 * 60_000,
++  60_000,
++);
++const FULL_MS = configuredInterval(
++  process.env.SYNC_INTERVAL_MS,
++  LOW_COST_MODE ? 7 * 24 * 60 * 60_000 : 24 * 60 * 60_000,
++  60 * 60_000,
++);
+ const CONCURRENCY = Math.max(1, Math.min(20, Number(process.env.SYNC_CONCURRENCY) || 5));
++const ENQUEUE_JITTER_CAP_MS = LOW_COST_MODE ? 10 * 60_000 : 30_000;
++const KEEPALIVE_MS = LOW_COST_MODE ? 24 * 60 * 60_000 : 60 * 60_000;
+ 
+ new Worker('sync', async job => {
+   const accountId = job.data.accountId;
+@@ -77,7 +90,7 @@
+       for (const account of accounts) {
+         await syncQueue.add(kind === 'quick' ? 'quick' : 'account-sync', { accountId: account.id }, {
+           jobId: `${kind}-${account.id}-${bucket}`,
+-          delay: Math.floor(Math.random() * Math.min(30_000, intervalMs / 10)),
++          delay: Math.floor(Math.random() * Math.min(ENQUEUE_JITTER_CAP_MS, intervalMs / 10)),
+           attempts: 5,
+           backoff: { type: 'exponential', delay: 5_000 },
+           removeOnComplete: { age: retentionSeconds },
+@@ -96,10 +109,17 @@
+ setTimeout(() => {
+   void enqueue('quick');
+   setInterval(() => void enqueue('quick'), QUICK_MS);
+-}, 30_000);
++}, LOW_COST_MODE ? QUICK_MS : 30_000);
+ setInterval(() => void enqueue('full'), FULL_MS);
+ setTimeout(() => {
+   void keepAliveAll();
+-  setInterval(() => void keepAliveAll(), 3_600_000);
+-}, 60_000);
+-console.log(JSON.stringify({ event: 'workers_ready', quickIntervalMs: QUICK_MS, fullIntervalMs: FULL_MS, concurrency: CONCURRENCY }));
++  setInterval(() => void keepAliveAll(), KEEPALIVE_MS);
++}, LOW_COST_MODE ? 15 * 60_000 : 60_000);
++console.log(JSON.stringify({
++  event: 'workers_ready',
++  lowCostMode: LOW_COST_MODE,
++  quickIntervalMs: QUICK_MS,
++  fullIntervalMs: FULL_MS,
++  keepaliveIntervalMs: KEEPALIVE_MS,
++  concurrency: CONCURRENCY,
++}));
