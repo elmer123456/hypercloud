@@ -45,8 +45,23 @@ node <<'NODE'
 const fs = require('node:fs');
 function replaceOnce(file, before, after) {
 const source = fs.readFileSync(file, 'utf8');
-if (!source.includes(before)) throw new Error(`Expected pattern missing in ${file}: ${before.slice(0, 90)}`);
+if (source.includes(before)) {
 fs.writeFileSync(file, source.replace(before, after));
+return;
+}
+if (source.includes(after)) {
+console.log(`Already applied: ${file}`);
+return;
+}
+const escapeRegExp = value => value.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
+const lines = before.trim().split(/\r?\n/u).map(line => line.trim()).filter(Boolean);
+const pattern = new RegExp(lines.map(escapeRegExp).join('\\s+'), 'gu');
+const matches = [...source.matchAll(pattern)];
+if (matches.length !== 1) {
+throw new Error(`Expected one whitespace-tolerant match in ${file}, found ${matches.length}: ${before.slice(0, 90)}`);
+}
+const match = matches[0];
+fs.writeFileSync(file, source.slice(0, match.index) + after + source.slice(match.index + match[0].length));
 }
 replaceOnce('backend/src/controllers/admin.ts', ` const parsed = z.object({
 quantity: z.coerce.number().int().min(1).max(5000),
