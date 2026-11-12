@@ -392,4 +392,5 @@ if (fs.existsSync(htmlFile)) {
 NODE
 
 # Publish ATLOS recurring crypto checkout while preserving Mercado Pago.
+# Keep the generated Android package in sync with the selected release bundle.
 node atlos-patch.js
