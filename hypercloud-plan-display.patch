@@ -1,0 +1,102 @@
+--- a/backend/src/services/accountLimits.ts
++++ b/backend/src/services/accountLimits.ts
+@@ -9,6 +9,16 @@
+   }
+ }
+ 
++export type AccountPlan = 'trial' | 'premium' | 'enterprise' | 'custom' | 'legacy';
++
++export function accountPlanForLimit(limit: number | null): AccountPlan {
++  if (limit === null) return 'legacy';
++  if (limit === 5) return 'trial';
++  if (limit === 25) return 'premium';
++  if (limit === 100) return 'enterprise';
++  return 'custom';
++}
++
+ type AccountCreateData = Omit<Prisma.DrimeAccountUncheckedCreateInput, 'userId' | 'provider' | 'email'>;
+ type AccountUpdateData = Prisma.DrimeAccountUpdateInput;
+ 
+@@ -62,7 +72,13 @@
+     prisma.drimeAccount.count({ where: { userId } }),
+   ]);
+   const limit = user?.accountLimit ?? null;
+-  return { connected, limit, remaining: limit === null ? null : Math.max(0, limit - connected), canConnect: limit === null || connected < limit };
++  return {
++    plan: accountPlanForLimit(limit),
++    connected,
++    limit,
++    remaining: limit === null ? null : Math.max(0, limit - connected),
++    canConnect: limit === null || connected < limit,
++  };
+ }
+ 
+ /** Only the oldest accounts within the assigned tier may run sync jobs after a downgrade. */
+--- a/frontend/src/pages/Plans.tsx
++++ b/frontend/src/pages/Plans.tsx
+@@ -1,6 +1,8 @@
+ import { ArrowLeft, ArrowUpRight, Check, Cloud, CreditCard, Sparkles } from 'lucide-react';
+ import { Link, useLocation } from 'react-router-dom';
++import { useQuery } from '@tanstack/react-query';
+ import { BrandMark } from '../components/BrandMark';
++import { api } from '../services/api';
+ 
+ const premiumUrl = String(import.meta.env.VITE_MP_PREMIUM_URL || 'https://mpago.la/27XFyhf').trim();
+ const enterpriseUrl = String(import.meta.env.VITE_MP_ENTERPRISE_URL || 'https://mpago.la/12wizvb').trim();
+@@ -95,6 +97,25 @@
+ }
+ export function PlansPage() {
+ const registrationComplete = new URLSearchParams(useLocation().search).get('registro') === '1';
++const hasSession = Boolean(localStorage.getItem('token'));
++const currentPlan = useQuery({
++  queryKey: ['account-capacity'],
++  queryFn: async () => (await api.get('/accounts/capacity')).data as {
++    plan: 'trial' | 'premium' | 'enterprise' | 'custom' | 'legacy';
++    connected: number;
++    limit: number | null;
++    remaining: number | null;
++  },
++  enabled: hasSession,
++  staleTime: 30_000,
++});
++const planLabels = {
++  trial: 'Trial',
++  premium: 'Premium',
++  enterprise: 'Enterprise',
++  custom: 'Personalizado',
++  legacy: 'Legado',
++} as const;
+ return (
+     <main className="min-h-screen bg-[#07090d] px-4 py-6 text-white sm:px-6 sm:py-10">
+       <div className="mx-auto max-w-6xl">
+@@ -114,6 +135,30 @@
+ </div>
+ )}
+ 
++{hasSession && (
++<section aria-label="Tu plan actual" className="mx-auto mt-8 flex max-w-4xl flex-col gap-3 rounded-2xl border border-emerald-300/25 bg-emerald-300/[.06] p-5 sm:flex-row sm:items-center sm:justify-between sm:p-6">
++  <div>
++    <p className="text-xs font-semibold uppercase tracking-wider text-emerald-200">Plan asignado a tu cuenta</p>
++    {currentPlan.isLoading ? (
++      <p className="mt-2 text-sm text-white/65" role="status">Consultando tu plan…</p>
++    ) : currentPlan.isError ? (
++      <p className="mt-2 text-sm text-amber-200" role="alert">No se pudo consultar el plan. Actualiza la página para volver a intentarlo.</p>
++    ) : currentPlan.data ? (
++      <>
++        <h2 className="mt-1 text-2xl font-black">{planLabels[currentPlan.data.plan] ?? 'Plan asignado'}</h2>
++        <p className="mt-1 text-sm text-white/70">
++          {currentPlan.data.limit === null
++            ? `${currentPlan.data.connected} cuentas conectadas · límite heredado sin máximo registrado`
++            : `${currentPlan.data.connected} de ${currentPlan.data.limit} cuentas conectadas · ${currentPlan.data.remaining} disponibles`}
++        </p>
++        {currentPlan.data.plan === 'legacy' && <p className="mt-1 text-xs text-white/55">Tus cuentas conservan el acceso actual; el administrador puede asignarte un plan.</p>}
++      </>
++    ) : null}
++  </div>
++  <Link to="/files" className="inline-flex min-h-10 items-center justify-center rounded-lg border border-white/15 px-4 py-2 text-sm font-semibold text-white/80 hover:bg-white/10">Ver mis cuentas</Link>
++</section>
++)}
++
+ <section className="mx-auto mt-12 max-w-3xl text-center sm:mt-16">
+           <span className="inline-flex items-center gap-2 rounded-full border border-emerald-300/20 bg-emerald-300/10 px-3 py-1.5 text-xs font-semibold text-emerald-200">
+             <Sparkles size={14} aria-hidden="true"/>Planes de Hypercloud
