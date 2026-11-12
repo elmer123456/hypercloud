@@ -416,3 +416,10 @@ NODE
 # Publish ATLOS recurring crypto checkout while preserving Mercado Pago.
 # Keep the generated Android package in sync with the selected release bundle.
 node atlos-patch.js
+
+# Show the persisted account plan to each signed-in user on the Plans page.
+if [ -f hypercloud-plan-display.patch ]; then
+  git apply --check --whitespace=nowarn hypercloud-plan-display.patch
+  git apply --whitespace=nowarn hypercloud-plan-display.patch
+  echo "Current account plan display applied"
+fi
