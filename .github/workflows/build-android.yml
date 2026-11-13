@@ -15,6 +15,7 @@ on:
       - 'bootstrap.sh'
       - '.github/workflows/build-android.yml'
       - 'hypercloud-vault-startup-retry.patch'
+      - 'hypercloud-low-cost.patch'
 
 
 
