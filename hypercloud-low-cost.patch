@@ -120,3 +120,102 @@
 +  keepaliveIntervalMs: KEEPALIVE_MS,
 +  concurrency: CONCURRENCY,
 +}));
+--- a/frontend/src/pages/Projects.tsx
++++ b/frontend/src/pages/Projects.tsx
+@@ -4,7 +4,7 @@
+ import { ArrowLeft, Bug, ExternalLink, FolderKanban, Lightbulb, Link2, Pencil, Plus, Rocket, Save, Trash2, Wrench } from 'lucide-react';
+ import { App } from '@capacitor/app';
+ import { Network } from '@capacitor/network';
+-import { api } from '../services/api';
++import { api, getWithStartupRetry } from '../services/api';
+ import { usePinAccess } from '../components/PinProtected';
+ import {
+   canSyncProjectQueueOnWifi,
+@@ -34,10 +34,10 @@
+  const {offlineProjectKey,offlineMode}=usePinAccess();
+  const [offlineState,setOfflineState]=useState<OfflineProjectState|null>(null),[cacheReady,setCacheReady]=useState(false),[online,setOnline]=useState(navigator.onLine),[wifiReady,setWifiReady]=useState(false);
+  useEffect(()=>{let active=true;setCacheReady(false);if(!offlineProjectKey){setOfflineState(null);setCacheReady(true);return;}void readOfflineProjectState(offlineProjectKey).then(state=>{if(!active)return;setOfflineState(state);if(state){qc.setQueryData(['projects'],state.projects);for(const [id,detail] of Object.entries(state.details))qc.setQueryData(['project',id],detail);}setCacheReady(true);});return()=>{active=false;};},[offlineProjectKey,qc]);
+- const listQ=useQuery<Project[]>({queryKey:['projects'],enabled:cacheReady&&!offlineMode,initialDataUpdatedAt:offlineState?.savedAt,queryFn:async()=>{if(offlineProjectKey)void syncOfflineProjectQueue(offlineProjectKey).catch(()=>{});const {data}=await api.get<Project[]>('/projects',{timeout:2500});const prior=offlineProjectKey?(await readOfflineProjectState(offlineProjectKey)):null;let merged=data;if(prior?.queue.length){const pendingIds=new Set(prior.queue.map(op=>op.projectId));merged=[...merged.filter(p=>!pendingIds.has(p.id)),...prior.projects.filter(p=>pendingIds.has(p.id))];}if(offlineProjectKey){const next=prior||{projects:[],details:{},queue:[],conflictTargets:{},lastSyncedAt:{},savedAt:Date.now()};next.projects=merged;for(const p of data)next.lastSyncedAt[p.id]=p.updatedAt;await writeOfflineProjectState(offlineProjectKey,next);setOfflineState(next);}return merged;},retry:false,refetchOnReconnect:true,refetchOnMount:'always'});
++ const listQ=useQuery<Project[]>({queryKey:['projects'],enabled:cacheReady&&!offlineMode,initialDataUpdatedAt:offlineState?.savedAt,queryFn:async({signal})=>{if(offlineProjectKey)void syncOfflineProjectQueue(offlineProjectKey).catch(()=>{});const {data}=await getWithStartupRetry<Project[]>('/projects',signal);const prior=offlineProjectKey?(await readOfflineProjectState(offlineProjectKey)):null;let merged=data;if(prior?.queue.length){const pendingIds=new Set(prior.queue.map(op=>op.projectId));merged=[...merged.filter(p=>!pendingIds.has(p.id)),...prior.projects.filter(p=>pendingIds.has(p.id))];}if(offlineProjectKey){const next=prior||{projects:[],details:{},queue:[],conflictTargets:{},lastSyncedAt:{},savedAt:Date.now()};next.projects=merged;for(const p of data)next.lastSyncedAt[p.id]=p.updatedAt;await writeOfflineProjectState(offlineProjectKey,next);setOfflineState(next);}return merged;},retry:false,refetchOnReconnect:true,refetchOnMount:'always'});
+  const [selectedId,setSelectedId]=useState('');
+  const cachedDetail=selectedId?offlineState?.details[selectedId]:undefined;
+- const detailQ=useQuery<Project>({queryKey:['project',selectedId],queryFn:async()=>{if(offlineProjectKey)void syncOfflineProjectQueue(offlineProjectKey).catch(()=>{});const {data}=await api.get<Project>(`/projects/${selectedId}`,{timeout:2500});if(offlineProjectKey){const state=(await readOfflineProjectState(offlineProjectKey))||{projects:[],details:{},queue:[],conflictTargets:{},lastSyncedAt:{},savedAt:Date.now()};state.details[selectedId]=data;state.lastSyncedAt[selectedId]=data.updatedAt;await writeOfflineProjectState(offlineProjectKey,state);setOfflineState(state);}return data;},enabled:!!selectedId&&cacheReady&&!offlineMode,initialData:cachedDetail,initialDataUpdatedAt:offlineState?.savedAt,retry:false,refetchOnReconnect:true,refetchOnMount:'always'});
++ const detailQ=useQuery<Project>({queryKey:['project',selectedId],queryFn:async({signal})=>{if(offlineProjectKey)void syncOfflineProjectQueue(offlineProjectKey).catch(()=>{});const {data}=await getWithStartupRetry<Project>(`/projects/${selectedId}`,signal);if(offlineProjectKey){const state=(await readOfflineProjectState(offlineProjectKey))||{projects:[],details:{},queue:[],conflictTargets:{},lastSyncedAt:{},savedAt:Date.now()};state.details[selectedId]=data;state.lastSyncedAt[selectedId]=data.updatedAt;await writeOfflineProjectState(offlineProjectKey,state);setOfflineState(state);}return data;},enabled:!!selectedId&&cacheReady&&!offlineMode,initialData:cachedDetail,initialDataUpdatedAt:offlineState?.savedAt,retry:false,refetchOnReconnect:true,refetchOnMount:'always'});
+  const [editOpen,setEditOpen]=useState(false),[editingId,setEditingId]=useState(''),[form,setForm]=useState<ProjectForm>(fresh()),[busy,setBusy]=useState(false),[error,setError]=useState('');
+  const [updateTitle,setUpdateTitle]=useState(''),[updateBody,setUpdateBody]=useState(''),[updateType,setUpdateType]=useState<Update['type']>('IMPROVEMENT');
+  const projects=listQ.data||[], active=projects.filter(p=>p.status==='ACTIVE').length, live=projects.filter(p=>p.status==='LIVE').length;
+--- a/frontend/src/pages/VibeX.tsx
++++ b/frontend/src/pages/VibeX.tsx
+@@ -5,7 +5,7 @@
+   ArrowDownToLine, Check, ExternalLink, Github, Globe2, Pencil, Plus,
+   ShieldAlert, Trash2, X, Braces, Monitor,
+ } from 'lucide-react';
+-import { api } from '../services/api';
++import { api, getWithStartupRetry } from '../services/api';
+ import launcherTemplate from '../scripts/vibex-open-profiles.ps1?raw';
+ 
+ type Provider = 'NOTION' | 'GITHUB';
+@@ -76,12 +76,12 @@
+   const qc = useQueryClient();
+   const sessionsQ = useQuery({
+     queryKey: ['vibex-sessions'],
+-    queryFn: async () => (await api.get('/vibex/sessions', { timeout: 15_000 })).data as Session[],
++    queryFn: async ({ signal }) => (await getWithStartupRetry<Session[]>('/vibex/sessions', signal)).data,
+     retry: false,
+   });
+   const projectsQ = useQuery({
+     queryKey: ['projects'],
+-    queryFn: async () => (await api.get('/projects', { timeout: 15_000 })).data as Project[],
++    queryFn: async ({ signal }) => (await getWithStartupRetry<Project[]>('/projects', signal)).data,
+     retry: false,
+   });
+   const sessions = sessionsQ.data || [];
+--- a/frontend/src/lib/offlineProjects.ts
++++ b/frontend/src/lib/offlineProjects.ts
+@@ -283,7 +283,7 @@
+       if (!(await canSyncProjectQueueOnWifi())) break;
+       try {
+         if (operation.kind === 'create') {
+-          const { data } = await api.post('/projects', { ...operation.data, id: operation.projectId }, { timeout: 2500 });
++          const { data } = await api.post('/projects', { ...operation.data, id: operation.projectId }, { timeout: 75_000 });
+           state.lastSyncedAt[operation.projectId] = data.updatedAt || new Date().toISOString();
+         } else if (operation.kind === 'update') {
+           const conflictId = state.conflictTargets[operation.projectId];
+@@ -292,9 +292,9 @@
+               ...operation.data,
+               id: conflictId,
+               name: conflictName(String(operation.data.name || 'Proyecto')),
+-            }, { timeout: 2500 });
++            }, { timeout: 75_000 });
+           } else {
+-            const { data: current } = await api.get(`/projects/${operation.projectId}`, { timeout: 2500 });
++            const { data: current } = await api.get(`/projects/${operation.projectId}`, { timeout: 75_000 });
+             const expected = state.lastSyncedAt[operation.projectId] || operation.baseUpdatedAt;
+             if (expected && new Date(current.updatedAt).getTime() !== new Date(expected).getTime()) {
+               const id = crypto.randomUUID();
+@@ -304,20 +304,20 @@
+                 ...operation.data,
+                 id,
+                 name: conflictName(String(operation.data.name || current.name || 'Proyecto')),
+-              }, { timeout: 2500 });
++              }, { timeout: 75_000 });
+               state.lastSyncedAt[id] = new Date().toISOString();
+             } else {
+-              await api.put(`/projects/${operation.projectId}`, operation.data, { timeout: 2500 });
+-              const { data: updated } = await api.get(`/projects/${operation.projectId}`, { timeout: 2500 });
++              await api.put(`/projects/${operation.projectId}`, operation.data, { timeout: 75_000 });
++              const { data: updated } = await api.get(`/projects/${operation.projectId}`, { timeout: 75_000 });
+               state.lastSyncedAt[operation.projectId] = updated.updatedAt;
+             }
+           }
+         } else if (operation.kind === 'addUpdate') {
+           const targetId = state.conflictTargets[operation.projectId] || operation.projectId;
+-          await api.post(`/projects/${targetId}/updates`, { ...operation.data, id: operation.updateId }, { timeout: 2500 });
++          await api.post(`/projects/${targetId}/updates`, { ...operation.data, id: operation.updateId }, { timeout: 75_000 });
+         } else {
+           const targetId = state.conflictTargets[operation.projectId] || operation.projectId;
+-          await api.delete(`/projects/${targetId}/updates/${operation.updateId}`, { timeout: 2500 });
++          await api.delete(`/projects/${targetId}/updates/${operation.updateId}`, { timeout: 75_000 });
+         }
+         state.queue = state.queue.filter(item => item !== operation);
+         synced += 1;
