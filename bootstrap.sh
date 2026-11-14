@@ -423,3 +423,9 @@ if [ -f hypercloud-plan-display.patch ]; then
   git apply --whitespace=nowarn hypercloud-plan-display.patch
   echo "Current account plan display applied"
 fi
+# Apply media upload recovery and preview retry fix after selecting the release sources.
+if [ -f hypercloud-media-reliability.patch ]; then
+  git apply --check --whitespace=nowarn hypercloud-media-reliability.patch
+  git apply --whitespace=nowarn hypercloud-media-reliability.patch
+  echo "Media upload and preview reliability patch applied"
+fi
