@@ -1,0 +1,300 @@
+--- a/backend/src/services/providers/common.ts
++++ b/backend/src/services/providers/common.ts
+@@ -18,9 +18,11 @@
+  stream(f:FileRef,range?:string):Promise<StreamResult>;
+  thumbnail(ref:string):Promise<{type:string;data:Buffer}|null>;
+  uploadSimple(buf:Buffer,name:string,mime:string,parentId?:string|null):Promise<DrimeFile>;
+- begin(name:string,mime:string,size:number,parentId:string|null):Promise<UploadState>;
++ begin(name:string,mime:string,size:number,parentId:string|null,uploadId?:string):Promise<UploadState>;
+  put(state:UploadState,n:number,chunk:Buffer):Promise<string>;
+  finish(state:UploadState,parts:{PartNumber:number;ETag:string}[],name:string,mime:string,size:number,parentId:string|null):Promise<DrimeFile>;
++ verifyUploadedFile?(uploadId:string,parentId:string|null,size:number,name:string):Promise<DrimeFile>;
++ directStatus?(state:UploadState):Promise<{offset:number;done:boolean}>;
+  abort(state:UploadState):Promise<void>;
+  /** Inicio de sesión real (mantiene la cuenta activa). */
+  login?():Promise<void>;
+--- a/backend/src/services/providers/gdrive.ts
++++ b/backend/src/services/providers/gdrive.ts
+@@ -1,6 +1,6 @@
+ import axios,{AxiosError} from 'axios';import {env} from '../../config.js';import {Driver,FileRef,Entry,CapacityError,CredentialsError,SeqWriter,walkFlat,toDrimeFile,extOf} from './common.js';
+ const API='https://www.googleapis.com/drive/v3',UP='https://www.googleapis.com/upload/drive/v3/files';const FOLDER='application/vnd.google-apps.folder';
+-const FIELDS='id,name,mimeType,size,parents,modifiedTime,createdTime,hasThumbnail,trashed';
++const FIELDS='id,name,mimeType,size,parents,modifiedTime,createdTime,hasThumbnail,trashed,appProperties';
+ const tokens=new Map<string,{t:string;exp:number}>();const roots=new Map<string,string>();
+ const sleep=(ms:number)=>new Promise(r=>setTimeout(r,ms));
+ export const googleRedirect=()=>`${env.API_PUBLIC_URL.replace(/\/$/,'')}/api/clouds/google/callback`;
+@@ -34,8 +34,10 @@
+  async thumbnail(ref:string){if(!ref.startsWith('gthumb:'))return null;const d=await this.req({url:`${API}/files/${ref.slice(7)}`,params:{fields:'thumbnailLink'}});if(!d.thumbnailLink)return null;const t=await this.token();
+   const r=await axios.get(String(d.thumbnailLink).replace(/=s\d+$/,'=s400'),{responseType:'arraybuffer',timeout:20000,headers:{Authorization:`Bearer ${t}`}});const type=String(r.headers['content-type']||'');return type.startsWith('image/')?{type,data:Buffer.from(r.data)}:null;}
+  async uploadSimple(buf:Buffer,name:string,mime:string,parentId?:string|null){const s=await this.begin(name,mime,buf.length,parentId||null);if(buf.length)await this.put(s,1,buf);return this.finish(s,[],name,mime,buf.length,parentId||null);}
+- async begin(name:string,mime:string,size:number,parentId:string|null){const r:any=await this.req({method:'post',url:UP,raw:true,params:{uploadType:'resumable',fields:FIELDS},data:{name,parents:[parentId||'root']},headers:{'X-Upload-Content-Type':mime,'X-Upload-Content-Length':String(size)}});
++ async begin(name:string,mime:string,size:number,parentId:string|null,uploadId?:string){const r:any=await this.req({method:'post',url:UP,raw:true,params:{uploadType:'resumable',fields:FIELDS},data:{name,parents:[parentId||'root'],...(uploadId?{appProperties:{hypercloudUploadId:uploadId}}:{})},headers:{'X-Upload-Content-Type':mime,'X-Upload-Content-Length':String(size)}});
+   const uri=String(r.headers.location||'');if(!uri)throw new Error('NO_UPLOAD_SESSION');const st:any={uri,size,offset:0,result:null};st.w=new SeqWriter((n,b)=>this.writeChunk(st,n,b));return st;}
++ async verifyUploadedFile(uploadId:string,parentId:string|null,size:number,name:string){const esc=uploadId.replace(/\\/g,'\\\\').replace(/'/g,"\\'");const files=await this.listQ(`appProperties has { key='hypercloudUploadId' and value='${esc}' } and trashed=false`,{pageSize:10},10);const f=files.find((x:any)=>x.name===name&&Number(x.size||0)===size&&(x.parents||[]).includes(parentId||'root'));if(!f)throw Object.assign(new Error('DIRECT_UPLOAD_NOT_FOUND'),{status:409,code:'DIRECT_UPLOAD_NOT_FOUND'});return toDrimeFile(await this.toEntry(f));}
++ async directStatus(st:any){try{const r=await axios.put(st.uri,undefined,{headers:{'Content-Range':`bytes */${st.size}`},timeout:30000,validateStatus:(s:number)=>s===308||s===200||s===201});if(r.status===308){const m=/bytes=0-(\d+)/.exec(String(r.headers.range||''));st.offset=m?Number(m[1])+1:0;return{offset:st.offset,done:false};}st.offset=st.size;st.result=r.data;return{offset:st.size,done:true};}catch(e:any){if(e?.response?.status===404)throw Object.assign(new Error('DIRECT_SESSION_EXPIRED'),{code:'DIRECT_SESSION_EXPIRED',status:404});mapErr(e);}}
+  private async writeChunk(st:any,n:number,buf:Buffer):Promise<void>{const start=(n-1)*8*1024*1024;if(start+buf.length<=st.offset)return;const from=Math.max(0,st.offset-start);const body=buf.subarray(from);const a=start+from,b=start+buf.length-1;
+   for(let t=0;;t++){try{const r=await axios.put(st.uri,body,{headers:{'Content-Range':`bytes ${a}-${b}/${st.size}`},maxBodyLength:Infinity,maxContentLength:Infinity,timeout:300000,validateStatus:(s:number)=>s===308||s===200||s===201});
+     if(r.status===308){const m=/bytes=0-(\d+)/.exec(String(r.headers.range||''));st.offset=m?Number(m[1])+1:0;if(st.offset<b+1)throw new Error('PARTIAL_CHUNK');}else{st.offset=st.size;st.result=r.data;}return;}
+--- a/backend/src/controllers/uploads.ts
++++ b/backend/src/controllers/uploads.ts
+@@ -1,7 +1,7 @@
+ import {Router,raw} from 'express';import crypto from 'node:crypto';import {z} from 'zod';import {prisma,jsonBigInt} from '../lib.js';import {isCapacityError,DrimeFile} from '../services/drimeClient.js';import {driverById} from '../services/providers/index.js';import {accountManager,NoSpaceError,reservedOf} from '../services/accountManager.js';import {ensureFolder,cleanPath,joinPath,saveEntry} from '../services/folders.js';import {contentUrl} from '../services/streamLinks.js';
+ export const uploadsRouter=Router();
+ const SIMPLE=5*1024*1024,PART=8*1024*1024;
+-type Session={id:string;userId:string;accountId:string;accountName:string;name:string;mime:string;size:number;path:string;parentId:string|null;mode:'simple'|'multipart';state?:any;parts:Map<number,string>;created:number;batch?:string;fixed?:boolean;simpleInProgress?:boolean;completing?:boolean};
++type Session={id:string;userId:string;accountId:string;accountName:string;name:string;mime:string;size:number;path:string;parentId:string|null;mode:'simple'|'multipart'|'direct';state?:any;parts:Map<number,string>;created:number;batch?:string;fixed?:boolean;simpleInProgress?:boolean;completing?:boolean};
+ const sessions=new Map<string,Session>();const completedUploads=new Map<string,{userId:string;at:number}>();const batches=new Map<string,{accountId:string;at:number}>();
+ setInterval(()=>{const old=Date.now()-6*3600000;for(const [k,s] of sessions)if(s.created<old){accountManager.release(s.accountId,BigInt(s.size));sessions.delete(k);}for(const [k,b] of batches)if(b.at<old)batches.delete(k);for(const [k,c] of completedUploads)if(c.at<old)completedUploads.delete(k);},600000).unref();
+ const clientFor=async(accountId:string)=>{const {a,driver}=await driverById(accountId);return {a,client:driver};};
+@@ -13,9 +13,9 @@
+ uploadsRouter.post('/init',async(req,res,next)=>{try{const x=z.object({name:z.string().min(1).max(255),size:z.coerce.number().int().min(0),mime:z.string().max(200).optional(),path:z.string().max(2000).optional(),batch:z.string().max(100).optional(),accountId:z.string().uuid().optional()}).parse(req.body);
+  const path=cleanPath(x.path);const name=x.name.replace(/[\\/]/g,'_');const mime=x.mime||'application/octet-stream';const excluded:string[]=[];
+  for(let attempt=0;attempt<6;attempt++){const acc=await pick(req.userId!,x.size,path,x.batch,excluded,x.accountId);const {client}=await clientFor(acc.id);
+-  try{const parentId=await ensureFolder(acc.id,client,path);const s:Session={id:crypto.randomUUID(),userId:req.userId!,accountId:acc.id,accountName:acc.name,name,mime,size:x.size,path,parentId,mode:x.size<SIMPLE?'simple':'multipart',parts:new Map(),created:Date.now(),batch:x.batch,fixed:!!x.accountId};
+-   if(s.mode==='multipart')s.state=await client.begin(name,mime,x.size,parentId);
+-   accountManager.reserve(acc.id,BigInt(x.size));sessions.set(s.id,s);return res.status(201).json({id:s.id,mode:s.mode,partSize:PART,parts:s.mode==='multipart'?Math.max(1,Math.ceil(x.size/PART)):1,account:{id:acc.id,name:acc.name}});
++  try{const parentId=await ensureFolder(acc.id,client,path);const id=crypto.randomUUID();const mode=acc.provider==='GDRIVE'&&x.size>=SIMPLE?'direct':x.size<SIMPLE?'simple':'multipart';const s:Session={id,userId:req.userId!,accountId:acc.id,accountName:acc.name,name,mime,size:x.size,path,parentId,mode,parts:new Map(),created:Date.now(),batch:x.batch,fixed:!!x.accountId};
++   if(s.mode==='multipart'||s.mode==='direct')s.state=await client.begin(name,mime,x.size,parentId,s.mode==='direct'?id:undefined);
++   accountManager.reserve(acc.id,BigInt(x.size));sessions.set(s.id,s);return res.status(201).json({id:s.id,mode:s.mode,partSize:PART,parts:s.mode==='multipart'?Math.max(1,Math.ceil(x.size/PART)):1,...(s.mode==='direct'?{uploadUrl:s.state?.uri}:{}),account:{id:acc.id,name:acc.name}});
+   }catch(e){if(!isCapacityError(e))throw e;await accountManager.block(acc.id);excluded.push(acc.id);}}
+  throw new NoSpaceError();}catch(e:any){if(e?.code==='NO_SPACE_AVAILABLE')return res.status(507).json({error:'NO_SPACE_AVAILABLE',message:'Ninguna cuenta tiene espacio suficiente'});if(['TARGET_NOT_FOUND','TARGET_UNAVAILABLE','TARGET_FULL'].includes(e?.code))return res.status(e.code==='TARGET_NOT_FOUND'?404:507).json({error:e.code,message:e.message});next(e);}});
+ const own=(req:any,res:any)=>{const s=sessions.get(req.params.id);if(!s||s.userId!==req.userId){res.status(404).json({error:'UPLOAD_NOT_FOUND'});return null;}return s;};
+@@ -26,12 +26,17 @@
+  const s=own(req,res);if(!s)return;
+  res.json({id:s.id,status:'active',mode:s.mode,partSize:PART,parts:s.mode==='multipart'?Math.max(1,Math.ceil(s.size/PART)):1,completedParts:[...s.parts.keys()],inProgress:!!s.simpleInProgress||!!s.completing,account:{id:s.accountId,name:s.accountName}});
+ });
++uploadsRouter.get('/:id/direct-status',async(req,res,next)=>{try{const s=own(req,res);if(!s)return;if(s.mode!=='direct')return res.status(400).json({error:'NOT_DIRECT_UPLOAD'});const {client}=await clientFor(s.accountId);if(!client.directStatus)return res.status(400).json({error:'DIRECT_UPLOAD_UNSUPPORTED'});res.json(await client.directStatus(s.state));}catch(e:any){if(e?.code==='DIRECT_SESSION_EXPIRED')return res.status(404).json({error:'DIRECT_SESSION_EXPIRED'});next(e);}});
+ async function finish(req:any,res:any,s:Session,remote:DrimeFile){
+  const f=await saveEntry(s.accountId,{id:remote.id,name:remote.name||s.name,file_size:remote.size||s.size,mime:remote.mimeType||s.mime,extension:remote.extension,hash:remote.hash,created_at:remote.createdAt,updated_at:remote.createdAt,type:undefined},s.path);
+  if(remote.thumbnailUrl)await prisma.file.update({where:{id:f.id},data:{thumbnailUrl:remote.thumbnailUrl}});
+- const a=await prisma.drimeAccount.findUnique({where:{id:s.accountId}});if(a){const used=a.usedSpace+BigInt(s.size);await accountManager.applyQuota(a.id,a.totalSpace,used);}
++ const a=await prisma.drimeAccount.findUnique({where:{id:s.accountId}});if(a){if(s.mode==='direct'){const {client}=await clientFor(s.accountId);const quota=await client.quota();await accountManager.applyQuota(a.id,quota.totalSpace,quota.usedSpace);}else{const used=a.usedSpace+BigInt(s.size);await accountManager.applyQuota(a.id,a.totalSpace,used);}}
+  sessions.delete(s.id);accountManager.release(s.accountId,BigInt(s.size));completedUploads.set(s.id,{userId:s.userId,at:Date.now()});
+  res.status(201).json(jsonBigInt(withUrl(req,f)));}
++uploadsRouter.post('/direct-complete',async(req,res,next)=>{try{const x=z.object({sessionId:z.string().uuid(),accountId:z.string().uuid(),name:z.string().min(1).max(255),size:z.coerce.number().int().min(0),mime:z.string().max(200).optional(),path:z.string().max(2000).optional()}).parse(req.body);const path=cleanPath(x.path);const name=x.name.replace(/[\\/]/g,'_');const mime=x.mime||'application/octet-stream';let s=sessions.get(x.sessionId);
++ if(s){if(s.userId!==req.userId)return res.status(404).json({error:'UPLOAD_NOT_FOUND'});if(s.mode!=='direct'||s.accountId!==x.accountId||s.name!==name||s.size!==x.size||s.path!==path||s.mime!==mime)return res.status(409).json({error:'UPLOAD_MISMATCH'});}
++ else{const a=await prisma.drimeAccount.findFirst({where:{id:x.accountId,userId:req.userId}});if(!a)return res.status(404).json({error:'ACCOUNT_NOT_FOUND'});if(a.provider!=='GDRIVE')return res.status(400).json({error:'DIRECT_UPLOAD_UNSUPPORTED'});const {client}=await clientFor(a.id);const parentId=await ensureFolder(a.id,client,path);s={id:x.sessionId,userId:req.userId!,accountId:a.id,accountName:a.name,name,mime,size:x.size,path,parentId,mode:'direct',parts:new Map(),created:Date.now()};}
++ if(s.completing)return res.status(409).json({error:'UPLOAD_IN_PROGRESS'});s.completing=true;try{const {client}=await clientFor(s.accountId);if(!client.verifyUploadedFile)return res.status(400).json({error:'DIRECT_UPLOAD_UNSUPPORTED'});const remote=await client.verifyUploadedFile(s.id,s.parentId,s.size,s.name);return await finish(req,res,s,remote);}catch(e:any){s.completing=false;if(e?.code==='DIRECT_UPLOAD_NOT_FOUND')return res.status(409).json({error:'DIRECT_UPLOAD_NOT_READY'});throw e;}}catch(e){next(e);}});
+ uploadsRouter.put('/:id/simple',raw({type:()=>true,limit:SIMPLE+1024}),async(req,res,next)=>{const s=own(req,res);if(!s)return;if(s.simpleInProgress)return res.status(409).json({error:'UPLOAD_IN_PROGRESS'});s.simpleInProgress=true;try{const body=Buffer.isBuffer(req.body)?req.body:Buffer.alloc(0);
+  const excluded:string[]=[];for(let attempt=0;attempt<6;attempt++){const {client}=await clientFor(s.accountId);
+   try{const remote=await client.uploadSimple(body,s.name,s.mime,s.parentId);return await finish(req,res,s,remote);}
+@@ -42,5 +47,5 @@
+ uploadsRouter.post('/:id/complete',async(req,res,next)=>{try{const s=own(req,res);if(!s)return;const expected=Math.max(1,Math.ceil(s.size/PART));if(s.parts.size<expected)return res.status(400).json({error:'MISSING_PARTS',have:s.parts.size,expected});
+  if(s.completing)return res.status(409).json({error:'UPLOAD_IN_PROGRESS'});s.completing=true;const {client}=await clientFor(s.accountId);try{const remote=await client.finish(s.state,[...s.parts].map(([PartNumber,ETag])=>({PartNumber,ETag})),s.name,s.mime,s.size,s.parentId);return await finish(req,res,s,remote);}
+  catch(e){s.completing=false;if(isCapacityError(e)){await accountManager.block(s.accountId);sessions.delete(s.id);accountManager.release(s.accountId,BigInt(s.size));return res.status(507).json({error:'NO_SPACE_RETRY',message:'La cuenta se llenó durante la subida; reintenta y se usará otra cuenta'});}throw e;}}catch(e){next(e);}});
+-uploadsRouter.delete('/:id',async(req,res)=>{const s=own(req,res);if(!s)return;sessions.delete(s.id);accountManager.release(s.accountId,BigInt(s.size));if(s.mode==='multipart'){const {client}=await clientFor(s.accountId);await client.abort(s.state);}res.status(204).end();});
++uploadsRouter.delete('/:id',async(req,res)=>{const s=own(req,res);if(!s)return;sessions.delete(s.id);accountManager.release(s.accountId,BigInt(s.size));if(s.mode==='multipart'||s.mode==='direct'){const {client}=await clientFor(s.accountId);await client.abort(s.state);}res.status(204).end();});
+ export {joinPath};
+--- a/frontend/src/hooks/useUpload.ts
++++ b/frontend/src/hooks/useUpload.ts
+@@ -11,6 +11,7 @@
+ const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+ const activeTasks = new Set<string>();
+ const PROGRESS_INTERVAL = 180;
++const DIRECT_CHUNK_SIZE = 32 * 1024 * 1024;
+ 
+ async function retry<T>(fn: () => Promise<T>, times = 4): Promise<T> {
+   for (let i = 0; ; i += 1) {
+@@ -23,6 +24,92 @@
+   }
+ }
+ 
++type DrivePutResult = { done: boolean; offset: number | null };
++
++function drivePut(url: string, body: Blob | null, contentRange: string, mime: string, onProgress?: (loaded: number) => void): Promise<DrivePutResult> {
++  return new Promise((resolve, reject) => {
++    const xhr = new XMLHttpRequest();
++    xhr.open('PUT', url);
++    xhr.setRequestHeader('Content-Range', contentRange);
++    if (body) xhr.setRequestHeader('Content-Type', mime || 'application/octet-stream');
++    xhr.responseType = 'text';
++    xhr.timeout = 0;
++    if (body && onProgress) xhr.upload.onprogress = event => onProgress(event.loaded);
++    xhr.onload = () => {
++      if (xhr.status === 308) {
++        const match = /bytes=0-(\d+)/i.exec(xhr.getResponseHeader('Range') || '');
++        resolve({ done: false, offset: match ? Number(match[1]) + 1 : null });
++      } else if (xhr.status === 200 || xhr.status === 201) {
++        resolve({ done: true, offset: null });
++      } else {
++        const error: any = new Error(`Google Drive respondió ${xhr.status}: ${xhr.responseText || 'falló la carga'}`);
++        error.response = { status: xhr.status, data: { message: xhr.responseText } };
++        if (xhr.status === 404) error.code = 'DIRECT_SESSION_EXPIRED';
++        reject(error);
++      }
++    };
++    xhr.onerror = () => {
++      const error: any = new Error('Se interrumpió la conexión con Google Drive.');
++      error.response = { status: 0, data: {} };
++      reject(error);
++    };
++    xhr.ontimeout = () => {
++      const error: any = new Error('La carga a Google Drive agotó el tiempo de espera.');
++      error.response = { status: 0, data: {} };
++      reject(error);
++    };
++    xhr.send(body);
++  });
++}
++
++async function driveOffset(task: PersistedUpload, size: number, fallback: number): Promise<number> {
++  if (!task.sessionId) throw new Error('Falta la sesión de Hypercloud para consultar el avance.');
++  try {
++    const { data } = await api.get(`/uploads/${task.sessionId}/direct-status`);
++    return data.done ? size : Math.max(0, Math.min(size, Number(data.offset ?? fallback)));
++  } catch (error: any) {
++    if (error?.response?.status === 404) {
++      error.code = 'DIRECT_SESSION_EXPIRED';
++      throw error;
++    }
++    throw error;
++  }
++}
++
++async function uploadDirectFile(task: PersistedUpload, onProgress: (progress: number) => void): Promise<void> {
++  const url = task.directUploadUrl;
++  if (!url) throw new Error('Falta la sesión directa de Google Drive; vuelve a iniciar la carga.');
++  let offset = await driveOffset(task, task.file.size, task.directOffset || 0);
++  onProgress(task.file.size ? offset * 100 / task.file.size : 100);
++  let failures = 0;
++  while (offset < task.file.size) {
++    const start = offset;
++    const end = Math.min(task.file.size, start + DIRECT_CHUNK_SIZE);
++    try {
++      const result = await drivePut(
++        url,
++        task.file.slice(start, end),
++        `bytes ${start}-${end - 1}/${task.file.size}`,
++        task.file.type || 'application/octet-stream',
++        loaded => onProgress(Math.min(99, (start + loaded) * 100 / (task.file.size || 1))),
++      );
++      offset = result.done ? task.file.size : await driveOffset(task, task.file.size, result.offset ?? end);
++      if (offset <= start) throw new Error('Google Drive no confirmó el avance de la carga.');
++      failures = 0;
++    } catch (error: any) {
++      if (error?.code === 'DIRECT_SESSION_EXPIRED') throw error;
++      if (failures >= 4) throw error;
++      failures += 1;
++      await sleep(1000 * 2 ** (failures - 1));
++      offset = await driveOffset(task, task.file.size, offset);
++      if (offset >= task.file.size) break;
++    }
++    task.directOffset = offset;
++    await saveUploadTask(task).catch(() => {});
++    onProgress(task.file.size ? offset * 100 / task.file.size : 100);
++  }
++}
++
+ export function fromFileList(list: FileList | File[]): UploadItem[] {
+   return Array.from(list).map(file => {
+     const relativePath = (file as any).webkitRelativePath || '';
+@@ -137,10 +224,18 @@
+         }
+       } catch (error: any) {
+         if (error?.response?.status !== 404) throw error;
+-        task.sessionId = undefined;
+-        task.mode = undefined;
+-        task.completedParts = [];
+-        await saveUploadTask(task).catch(() => {});
++        if (task.mode === 'direct' && task.directUploadUrl && task.accountId) {
++          status = { status: 'active', mode: 'direct', account: { id: task.accountId, name: task.accountName } };
++        } else {
++          task.sessionId = undefined;
++          task.mode = undefined;
++          task.directUploadUrl = undefined;
++          task.directOffset = undefined;
++          task.accountId = undefined;
++          task.accountName = undefined;
++          task.completedParts = [];
++          await saveUploadTask(task).catch(() => {});
++        }
+       }
+     }
+ 
+@@ -158,18 +253,36 @@
+       task.partSize = status.partSize;
+       task.parts = status.parts;
+       task.completedParts = [];
++      task.directUploadUrl = status.mode === 'direct' ? status.uploadUrl : undefined;
++      task.directOffset = status.mode === 'direct' ? 0 : undefined;
++      task.accountId = status.account?.id;
++      task.accountName = status.account?.name;
+       displayAccount = status.account?.name || '';
+       task.state = 'queued';
+       task.error = undefined;
+       await saveUploadTask(task);
+     } else {
+-      displayAccount = status?.account?.name || displayAccount;
++      displayAccount = status?.account?.name || task.accountName || displayAccount;
+       task.mode = status?.mode || task.mode;
+       task.partSize = status?.partSize || task.partSize;
+       task.parts = status?.parts || task.parts;
++      task.directUploadUrl = status?.uploadUrl || task.directUploadUrl;
++      task.accountId = status?.account?.id || task.accountId;
++      task.accountName = status?.account?.name || task.accountName;
+     }
+ 
+-    if (task.mode === 'simple') {
++    if (task.mode === 'direct') {
++      if (!task.accountId) throw new Error('No se identificó la cuenta de Google Drive para completar la carga.');
++      await uploadDirectFile(task, progress => setProgress(Math.min(99, Math.round(progress))));
++      await retry(() => api.post('/uploads/direct-complete', {
++        sessionId: task.sessionId,
++        accountId: task.accountId,
++        name: task.file.name,
++        size: task.file.size,
++        mime: task.file.type || undefined,
++        path: [task.basePath === '/' ? '' : task.basePath, task.dir].filter(Boolean).join('/') || '/',
++      }, { timeout: 0 }), 2);
++    } else if (task.mode === 'simple') {
+       // A short file-picker/app interruption does not force a restart; send again only if the server confirms no active request.
+       status = (await api.get(`/uploads/${task.sessionId}`)).data;
+       if (status.status === 'complete') {
+@@ -221,6 +334,10 @@
+       task.sessionRestarts = (task.sessionRestarts || 0) + 1;
+       task.sessionId = undefined;
+       task.mode = undefined;
++      task.directUploadUrl = undefined;
++      task.directOffset = undefined;
++      task.accountId = undefined;
++      task.accountName = undefined;
+       task.partSize = undefined;
+       task.parts = undefined;
+       task.completedParts = [];
+@@ -228,6 +345,21 @@
+       setUpload({ id: task.id, name: displayAccount ? `${task.name} → ${displayAccount}` : task.name, progress: 0, status: 'paused', error: task.error });
+       window.setTimeout(() => { void runTask(task, queryClient, setUpload); }, 750);
+       return false;
++    }
++    if (error?.code === 'DIRECT_SESSION_EXPIRED' && task.sessionId && (task.sessionRestarts || 0) < 2) {
++      task.sessionRestarts = (task.sessionRestarts || 0) + 1;
++      await api.delete(`/uploads/${task.sessionId}`).catch(() => {});
++      task.sessionId = undefined;
++      task.mode = undefined;
++      task.directUploadUrl = undefined;
++      task.directOffset = undefined;
++      task.accountId = undefined;
++      task.accountName = undefined;
++      task.completedParts = [];
++      await setTaskState('queued', 'La sesión de Drive venció; se reiniciará la carga.');
++      setUpload({ id: task.id, name: displayAccount ? `${task.name} → ${displayAccount}` : task.name, progress: 0, status: 'paused', error: task.error });
++      window.setTimeout(() => { void runTask(task, queryClient, setUpload); }, 750);
++      return false;
+     }
+     if (error?.response?.status === 404 && error?.response?.data?.error === 'TARGET_NOT_FOUND' && task.targetId) {
+       if (useUI.getState().uploadTarget === task.targetId) useUI.getState().setUploadTarget('');
+--- a/frontend/src/lib/uploadQueue.ts
++++ b/frontend/src/lib/uploadQueue.ts
+@@ -7,7 +7,11 @@
+   targetId?: string;
+   batch: string;
+   sessionId?: string;
+-  mode?: 'simple' | 'multipart';
++  mode?: 'simple' | 'multipart' | 'direct';
++  directUploadUrl?: string;
++  directOffset?: number;
++  accountId?: string;
++  accountName?: string;
+   partSize?: number;
+   parts?: number;
+   completedParts: number[];
