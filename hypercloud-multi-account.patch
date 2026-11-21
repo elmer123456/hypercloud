@@ -1,0 +1,393 @@
+diff --git a/backend/src/controllers/files.ts b/backend/src/controllers/files.ts
+index 8fe51b0..662d916 100644
+--- a/backend/src/controllers/files.ts
++++ b/backend/src/controllers/files.ts
+@@ -1,7 +1,8 @@
+ import {Router,Request} from 'express';import multer from 'multer';import {z} from 'zod';import {Prisma} from '@prisma/client';import {prisma,jsonBigInt} from '../lib.js';import {orchestrateUpload} from '../services/uploadOrchestrator.js';import {contentUrl} from '../services/streamLinks.js';import {driverFor} from '../services/providers/index.js';import {accountManager} from '../services/accountManager.js';import {ensureFolder,cleanPath,joinPath} from '../services/folders.js';
++import {deleteVirtualStorage,isVirtualStorage} from '../services/virtualStorage.js';
+ export const filesRouter=Router();const memory=multer({storage:multer.memoryStorage(),limits:{fileSize:200*1024*1024}});
+ const include={tags:{include:{tag:true}},account:{select:{id:true,name:true,provider:true}}} as const;
+-const withUrl=(req:Request,f:any)=>{const u=contentUrl(req,f);return{...f,contentUrl:u,downloadLink:u+'?download=1',thumbUrl:f.thumbnailUrl||f.fileType==='IMAGE'?u+'?thumb=1':null,hasThumb:!!f.thumbnailUrl,isFolder:f.mimeType==='folder'};};
++const withUrl=(req:Request,f:any)=>{const u=contentUrl(req,f);return{...f,...(isVirtualStorage(f.downloadUrl)?{downloadUrl:null}:{}),contentUrl:u,downloadLink:u+'?download=1',thumbUrl:f.thumbnailUrl||f.fileType==='IMAGE'?u+'?thumb=1':null,hasThumb:!!f.thumbnailUrl,isFolder:f.mimeType==='folder'};};
+ async function searchIds(userId:string,term:string){const like=`%${term}%`;const rows=await prisma.$queryRaw<{id:string}[]>`SELECT f.id FROM "File" f JOIN "DrimeAccount" a ON a.id=f."accountId" WHERE a."userId"=${userId}::uuid AND (f."fileName" ILIKE ${like} OR f."folderPath" ILIKE ${like} OR f."searchVector" @@ plainto_tsquery('spanish',${term}) OR similarity(f."fileName",${term})>0.25) LIMIT 500`;return rows.map(r=>r.id);}
+ filesRouter.get('/',async(req,res,next)=>{try{
+  const q=z.object({cursor:z.string().uuid().optional(),accountId:z.string().uuid().optional(),type:z.enum(['IMAGE','VIDEO','AUDIO','DOCUMENT','OTHER']).optional(),tagId:z.string().uuid().optional(),q:z.string().trim().min(1).max(100).optional(),mode:z.enum(['explorer','flat']).default('flat'),path:z.string().default('/'),dateFrom:z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),dateTo:z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),sort:z.enum(['newest','oldest','name-asc','name-desc','largest','smallest']).default('newest'),minSizeMb:z.coerce.number().finite().min(0).max(1000000).optional(),maxSizeMb:z.coerce.number().finite().min(0).max(1000000).optional()}).parse(req.query);
+@@ -34,10 +35,10 @@ filesRouter.post('/folders',async(req,res,next)=>{try{const x=z.object({name:z.s
+ // Para carpetas: se aplica a la misma ruta en todas las cuentas (el explorador las muestra fusionadas)
+ async function targets(userId:string,id:string){const f=await prisma.file.findFirst({where:{id,account:{userId}},include:{account:true}});if(!f)return [];if(f.mimeType!=='folder')return [f];return prisma.file.findMany({where:{account:{userId},mimeType:'folder',folderPath:f.folderPath,fileName:f.fileName},include:{account:true}});}
+ filesRouter.patch('/:id',async(req,res,next)=>{try{const x=z.object({name:z.string().trim().min(1).max(255).refine(v=>!/[\\/]/.test(v))}).parse(req.body);const list=await targets(req.userId!,req.params.id);if(!list.length)return res.status(404).json({error:'NOT_FOUND'});
+- for(const f of list){await clientOf(f.account).rename(f.drimeFileId,x.name,f.mimeType==='folder');await prisma.file.update({where:{id:f.id},data:{fileName:x.name,extension:f.mimeType==='folder'?null:(x.name.includes('.')?x.name.split('.').pop()!.toLowerCase():null)}});
++ for(const f of list){if(!isVirtualStorage(f.downloadUrl))await clientOf(f.account).rename(f.drimeFileId,x.name,f.mimeType==='folder');await prisma.file.update({where:{id:f.id},data:{fileName:x.name,extension:f.mimeType==='folder'?null:(x.name.includes('.')?x.name.split('.').pop()!.toLowerCase():null)}});
+   if(f.mimeType==='folder'){const oldP=joinPath(f.folderPath,f.fileName),newP=joinPath(f.folderPath,x.name);await prisma.$executeRaw`UPDATE "File" SET "folderPath"=(${newP}::text||substr("folderPath",${oldP.length+1}::int)) WHERE "accountId"=${f.accountId}::uuid AND ("folderPath"=${oldP} OR "folderPath" LIKE ${esc(oldP)+'/%'})`;}}
+  res.status(204).end();}catch(e){next(e);}});
+ filesRouter.delete('/:id',async(req,res,next)=>{try{const list=await targets(req.userId!,req.params.id);if(!list.length)return res.status(404).json({error:'NOT_FOUND'});
+- for(const f of list){await clientOf(f.account).remove(f.drimeFileId,f.mimeType==='folder',false);await prisma.file.delete({where:{id:f.id}}).catch(()=>{});
++ for(const f of list){if(isVirtualStorage(f.downloadUrl))await deleteVirtualStorage(f.downloadUrl!,req.userId!);else await clientOf(f.account).remove(f.drimeFileId,f.mimeType==='folder',false);await prisma.file.delete({where:{id:f.id}}).catch(()=>{});
+   if(f.mimeType==='folder'){const p=joinPath(f.folderPath,f.fileName);await prisma.file.deleteMany({where:{accountId:f.accountId,OR:[{folderPath:p},{folderPath:{startsWith:p+'/'}}]}});}}
+  res.status(204).end();}catch(e){next(e);}});
+diff --git a/backend/src/controllers/stream.ts b/backend/src/controllers/stream.ts
+index cd117a2..fd2071d 100644
+--- a/backend/src/controllers/stream.ts
++++ b/backend/src/controllers/stream.ts
+@@ -1,4 +1,5 @@
+ import {Router} from 'express';import {prisma} from '../lib.js';import {driverFor} from '../services/providers/index.js';import {verifyFile} from '../services/streamLinks.js';
++import {isVirtualStorage,streamVirtualStorage} from '../services/virtualStorage.js';
+ export const streamRouter=Router();
+ // Caché LRU en memoria para miniaturas (evita pedirlas a Drime cada vez que se refresca la cuadrícula).
+ const MAX=48*1024*1024;let used=0;const cache=new Map<string,{type:string;data:Buffer}>();const miss=new Map<string,number>();
+@@ -11,7 +12,7 @@ streamRouter.get('/:sig/:name?',async(req,res)=>{let fileId:string;try{fileId=ve
+   if(hit){res.setHeader('Content-Type',hit.type);res.setHeader('Cache-Control','private, max-age=86400');return res.end(hit.data);}
+   if(file.fileType!=='IMAGE'||Number(file.size)>25*1024*1024)return res.status(404).json({error:'NO_THUMBNAIL'});
+  }
+- try{const r=await client.stream(file,req.headers.range as string|undefined);
++ try{const range=req.headers.range as string|undefined;const r=isVirtualStorage(file.downloadUrl)?await streamVirtualStorage(file.downloadUrl!,file.account.userId,file,range):await client.stream(file,range);
+   const upstreamType=String(r.headers['content-type']||'').split(';')[0];const known=file.mimeType&&file.mimeType!=='folder'?file.mimeType:'';
+   let type=(!upstreamType||/octet-stream|binary|force-download/.test(upstreamType))&&known?known:upstreamType||known||'application/octet-stream';
+   if(/^text\/|json|xml|javascript/.test(type)&&!type.includes('charset'))type+='; charset=utf-8';
+diff --git a/backend/src/controllers/uploads.ts b/backend/src/controllers/uploads.ts
+index 8c11333..17a22da 100644
+--- a/backend/src/controllers/uploads.ts
++++ b/backend/src/controllers/uploads.ts
+@@ -1,32 +1,64 @@
+ import {Router,raw} from 'express';import crypto from 'node:crypto';import {z} from 'zod';import {prisma,jsonBigInt} from '../lib.js';import {isCapacityError,DrimeFile} from '../services/drimeClient.js';import {driverById} from '../services/providers/index.js';import {accountManager,NoSpaceError,reservedOf} from '../services/accountManager.js';import {ensureFolder,cleanPath,joinPath,saveEntry} from '../services/folders.js';import {contentUrl} from '../services/streamLinks.js';
++import {detectType} from '../workers/syncAccount.js';import {isAccountWithinPlan} from '../services/accountLimits.js';import {deleteVirtualStorage,encodeVirtualStorage,INTERNAL_PART_PREFIX,VirtualStorageManifest} from '../services/virtualStorage.js';
+ export const uploadsRouter=Router();
+-const SIMPLE=5*1024*1024,PART=8*1024*1024;
+-type Session={id:string;userId:string;accountId:string;accountName:string;name:string;mime:string;size:number;path:string;parentId:string|null;mode:'simple'|'multipart'|'direct';state?:any;parts:Map<number,string>;created:number;batch?:string;fixed?:boolean;simpleInProgress?:boolean;completing?:boolean};
++const SIMPLE=5*1024*1024,PART=8*1024*1024,SHARD_SIZE=1024*1024*1024,SHARDING_THRESHOLD=SHARD_SIZE,MAX_PARTS=250000,MAX_SHARDS=512;
++type StorageShard={accountId:string;accountName:string;offset:number;size:number;name:string;state:any;parts:Map<number,string>;remote?:DrimeFile};
++type Session={id:string;userId:string;accountId:string;accountName:string;name:string;mime:string;size:number;path:string;parentId:string|null;mode:'simple'|'multipart'|'direct'|'sharded';state?:any;parts:Map<number,string>;shards?:StorageShard[];created:number;batch?:string;fixed?:boolean;simpleInProgress?:boolean;completing?:boolean};
+ const sessions=new Map<string,Session>();const completedUploads=new Map<string,{userId:string;at:number}>();const batches=new Map<string,{accountId:string;at:number}>();
+-setInterval(()=>{const old=Date.now()-6*3600000;for(const [k,s] of sessions)if(s.created<old){accountManager.release(s.accountId,BigInt(s.size));sessions.delete(k);}for(const [k,b] of batches)if(b.at<old)batches.delete(k);for(const [k,c] of completedUploads)if(c.at<old)completedUploads.delete(k);},600000).unref();
++setInterval(()=>{const old=Date.now()-6*3600000;for(const [k,s] of sessions)if(s.created<old)void discardSession(s);for(const [k,b] of batches)if(b.at<old)batches.delete(k);for(const [k,c] of completedUploads)if(c.at<old)completedUploads.delete(k);},600000).unref();
+ const clientFor=async(accountId:string)=>{const {a,driver}=await driverById(accountId);return {a,client:driver};};
+-const withUrl=(req:any,f:any)=>{const u=contentUrl(req,f);return{...f,contentUrl:u,downloadLink:u+'?download=1',isFolder:f.mimeType==='folder'};};
++const withUrl=(req:any,f:any)=>{const u=contentUrl(req,f);return{...f,...(String(f.downloadUrl||'').startsWith('hcparts:v1:')?{downloadUrl:null}:{}),contentUrl:u,downloadLink:u+'?download=1',isFolder:f.mimeType==='folder'};};
++const releaseReservations=(s:Session)=>{if(s.shards?.length){for(const shard of s.shards)accountManager.release(shard.accountId,BigInt(shard.size));}else accountManager.release(s.accountId,BigInt(s.size));};
++async function discardSession(s:Session){sessions.delete(s.id);releaseReservations(s);if(s.shards?.length){for(const shard of s.shards){try{const {client}=await clientFor(shard.accountId);await client.abort(shard.state);}catch{}if(shard.remote)try{const {client}=await clientFor(shard.accountId);await client.remove(shard.remote.id,false,true);}catch(e:any){console.warn('multipart cleanup',shard.accountId,e?.message||e);}}}else if(s.mode==='multipart'||s.mode==='direct'){try{const {client}=await clientFor(s.accountId);await client.abort(s.state);}catch{}}}
++async function shardPlan(userId:string,size:number,path:string,batch?:string,excluded:string[]=[]){
++ const [user,accounts]=await Promise.all([prisma.user.findUnique({where:{id:userId},select:{uploadThreshold:true,uploadStrategy:true}}),prisma.drimeAccount.findMany({where:{userId,isActive:true,allowUploads:true,isBlocked:false,id:{notIn:excluded}},orderBy:{createdAt:'asc'}})]);
++ const threshold=BigInt(user?.uploadThreshold??95),preferred:string[]=[];const b=batch&&batches.get(batch);if(b)preferred.push(b.accountId);
++ if(path!=='/'){const segs=path.split('/').filter(Boolean);const parent=segs.length>1?'/'+segs.slice(0,-1).join('/'):'/';const owners=await prisma.file.findMany({where:{account:{userId},mimeType:'folder',folderPath:parent,fileName:segs[segs.length-1]},select:{accountId:true}});preferred.push(...owners.map(o=>o.accountId));}
++ const eligible=[] as {a:typeof accounts[number];free:bigint}[];
++ for(const a of accounts){if(!await isAccountWithinPlan(userId,a.id)||a.totalSpace<=0n)continue;const limit=a.totalSpace*threshold/100n;const free=limit-a.usedSpace-reservedOf(a.id);if(free>0n)eligible.push({a,free});}
++ const priority=new Map(preferred.map((id,i)=>[id,i]));
++ if(user?.uploadStrategy==='balance')eligible.sort((x,y)=>Number(y.free-x.free));else eligible.sort((x,y)=>(priority.get(x.a.id)??9999)-(priority.get(y.a.id)??9999));
++ let remaining=BigInt(size),offset=0;const plan:{accountId:string;accountName:string;offset:number;size:number}[]=[];
++ for(const {a,free:available} of eligible){let free=available;while(free>0n&&remaining>0n&&plan.length<MAX_SHARDS){const cap=[free,remaining,BigInt(SHARD_SIZE)].reduce((x,y)=>x<y?x:y);const amount=remaining<=cap?cap:(cap/BigInt(PART))*BigInt(PART);if(amount<=0n)break;plan.push({accountId:a.id,accountName:a.name,offset,size:Number(amount)});offset+=Number(amount);remaining-=amount;free-=amount;}}
++ return{plan,remaining:Number(remaining),capacity:Number(BigInt(size)-remaining)};
++}
++async function createShardedSession(userId:string,name:string,mime:string,size:number,path:string,batch?:string,excluded:string[]=[]){
++ const {plan,remaining,capacity}=await shardPlan(userId,size,path,batch,excluded);
++ if(remaining>0||plan.length<2)return{session:null,remaining,capacity};
++ const id=crypto.randomUUID(),shards:StorageShard[]=[];
++ for(const p of plan)accountManager.reserve(p.accountId,BigInt(p.size));
++ try{
++  const {client:folderClient}=await clientFor(plan[0].accountId);const parentId=await ensureFolder(plan[0].accountId,folderClient,path);
++  for(let index=0;index<plan.length;index++){const p=plan[index],{client}=await clientFor(p.accountId);const remoteName=`${INTERNAL_PART_PREFIX}${id}-${index+1}.bin`;const state=await client.begin(remoteName,'application/octet-stream',p.size,null,`${id}-${index+1}`);
++   shards.push({...p,name:remoteName,state,parts:new Map()});}
++  const s:Session={id,userId,accountId:plan[0].accountId,accountName:`${plan.length} cuentas`,name,mime,size,path,parentId,mode:'sharded',parts:new Map(),shards,created:Date.now(),batch};
++  sessions.set(id,s);if(batch)batches.set(batch,{accountId:s.accountId,at:Date.now()});return{session:s,remaining:0,capacity};
++ }catch(error){for(const p of plan)accountManager.release(p.accountId,BigInt(p.size));for(const shard of shards)try{const {client}=await clientFor(shard.accountId);await client.abort(shard.state);}catch{}throw error;}
++}
+ async function pick(userId:string,size:number,path:string,batch?:string,excluded:string[]=[],target?:string){if(target){const a=await prisma.drimeAccount.findFirst({where:{id:target,userId}});if(!a)throw Object.assign(new Error('Cuenta de destino no encontrada'),{status:404,code:'TARGET_NOT_FOUND'});if(!a.isActive)throw Object.assign(new Error(`La cuenta «${a.name}» está pausada; actívala en Configuración`),{code:'TARGET_UNAVAILABLE'});if(excluded.includes(a.id))throw Object.assign(new Error(`La cuenta «${a.name}» no tiene espacio suficiente`),{code:'TARGET_FULL'});const free=a.totalSpace-a.usedSpace-(reservedOf(a.id));if(a.totalSpace>0n&&BigInt(size)>free)throw Object.assign(new Error(`La cuenta «${a.name}» no tiene espacio suficiente para este archivo`),{code:'TARGET_FULL'});return a;}
+ const prefer:string[]=[];const b=batch&&batches.get(batch);if(b)prefer.push(b.accountId);
+  if(path!=='/'){const parts=path.split('/').filter(Boolean);const parent=parts.length>1?'/'+parts.slice(0,-1).join('/'):'/';const owners=await prisma.file.findMany({where:{account:{userId},mimeType:'folder',folderPath:parent,fileName:parts[parts.length-1]},select:{accountId:true}});prefer.push(...owners.map(o=>o.accountId));}
+  const acc=await accountManager.selectBestAccount(userId,BigInt(size),excluded,prefer);if(batch)batches.set(batch,{accountId:acc.id,at:Date.now()});return acc;}
+ uploadsRouter.post('/init',async(req,res,next)=>{try{const x=z.object({name:z.string().min(1).max(255),size:z.coerce.number().int().min(0),mime:z.string().max(200).optional(),path:z.string().max(2000).optional(),batch:z.string().max(100).optional(),accountId:z.string().uuid().optional()}).parse(req.body);
+  const path=cleanPath(x.path);const name=x.name.replace(/[\\/]/g,'_');const mime=x.mime||'application/octet-stream';const excluded:string[]=[];
+- for(let attempt=0;attempt<6;attempt++){const acc=await pick(req.userId!,x.size,path,x.batch,excluded,x.accountId);const {client}=await clientFor(acc.id);
++ try{for(let attempt=0;attempt<6;attempt++){const acc=await pick(req.userId!,x.size,path,x.batch,excluded,x.accountId);const {client}=await clientFor(acc.id);
+   try{const parentId=await ensureFolder(acc.id,client,path);const id=crypto.randomUUID();const mode=acc.provider==='GDRIVE'&&x.size>=SIMPLE?'direct':x.size<SIMPLE?'simple':'multipart';const s:Session={id,userId:req.userId!,accountId:acc.id,accountName:acc.name,name,mime,size:x.size,path,parentId,mode,parts:new Map(),created:Date.now(),batch:x.batch,fixed:!!x.accountId};
+    if(s.mode==='multipart'||s.mode==='direct')s.state=await client.begin(name,mime,x.size,parentId,s.mode==='direct'?id:undefined);
+    accountManager.reserve(acc.id,BigInt(x.size));sessions.set(s.id,s);return res.status(201).json({id:s.id,mode:s.mode,partSize:PART,parts:s.mode==='multipart'?Math.max(1,Math.ceil(x.size/PART)):1,...(s.mode==='direct'?{uploadUrl:s.state?.uri}:{}),account:{id:acc.id,name:acc.name}});
+   }catch(e){if(!isCapacityError(e))throw e;await accountManager.block(acc.id);excluded.push(acc.id);}}
+- throw new NoSpaceError();}catch(e:any){if(e?.code==='NO_SPACE_AVAILABLE')return res.status(507).json({error:'NO_SPACE_AVAILABLE',message:'Ninguna cuenta tiene espacio suficiente'});if(['TARGET_NOT_FOUND','TARGET_UNAVAILABLE','TARGET_FULL'].includes(e?.code))return res.status(e.code==='TARGET_NOT_FOUND'?404:507).json({error:e.code,message:e.message});next(e);}});
++ }catch(e:any){if(e?.code!=='NO_SPACE_AVAILABLE')throw e;}
++ if(!x.accountId&&x.size>=SHARDING_THRESHOLD){const result=await createShardedSession(req.userId!,name,mime,x.size,path,x.batch,excluded);if(result.session){const s=result.session;return res.status(201).json({id:s.id,mode:s.mode,partSize:PART,parts:Math.max(1,Math.ceil(x.size/PART)),account:{id:s.accountId,name:s.accountName},storageAccounts:[...new Set(s.shards!.map(shard=>shard.accountName))]});}
++  const available=Math.max(0,result.capacity);return res.status(507).json({error:'NO_SPACE_AVAILABLE',message:`El espacio disponible de tus cuentas conectadas (${available} bytes) no alcanza para este archivo. Conecta otra cuenta con espacio e inténtalo de nuevo.`});}
++ throw new NoSpaceError();}catch(e:any){if(e?.code==='NO_SPACE_AVAILABLE')return res.status(507).json({error:'NO_SPACE_AVAILABLE',message:'Ninguna cuenta tiene espacio suficiente; conecta otra cuenta con más espacio.'});if(['TARGET_NOT_FOUND','TARGET_UNAVAILABLE','TARGET_FULL'].includes(e?.code))return res.status(e.code==='TARGET_NOT_FOUND'?404:507).json({error:e.code,message:e.message});next(e);}});
+ const own=(req:any,res:any)=>{const s=sessions.get(req.params.id);if(!s||s.userId!==req.userId){res.status(404).json({error:'UPLOAD_NOT_FOUND'});return null;}return s;};
+ 
+ uploadsRouter.get('/:id',async(req,res)=>{
+  const completed=completedUploads.get(req.params.id);
+  if(completed&&completed.userId===req.userId)return res.json({id:req.params.id,status:'complete'});
+- const s=own(req,res);if(!s)return;
+- res.json({id:s.id,status:'active',mode:s.mode,partSize:PART,parts:s.mode==='multipart'?Math.max(1,Math.ceil(s.size/PART)):1,completedParts:[...s.parts.keys()],inProgress:!!s.simpleInProgress||!!s.completing,account:{id:s.accountId,name:s.accountName}});
++ const s=own(req,res);if(!s)return;s.created=Date.now();
++ res.json({id:s.id,status:'active',mode:s.mode,partSize:PART,parts:s.mode==='multipart'||s.mode==='sharded'?Math.max(1,Math.ceil(s.size/PART)):1,completedParts:[...s.parts.keys()],inProgress:!!s.simpleInProgress||!!s.completing,account:{id:s.accountId,name:s.accountName}});
+ });
+-uploadsRouter.get('/:id/direct-status',async(req,res,next)=>{try{const s=own(req,res);if(!s)return;if(s.mode!=='direct')return res.status(400).json({error:'NOT_DIRECT_UPLOAD'});const {client}=await clientFor(s.accountId);if(!client.directStatus)return res.status(400).json({error:'DIRECT_UPLOAD_UNSUPPORTED'});res.json(await client.directStatus(s.state));}catch(e:any){if(e?.code==='DIRECT_SESSION_EXPIRED')return res.status(404).json({error:'DIRECT_SESSION_EXPIRED'});next(e);}});
++uploadsRouter.get('/:id/direct-status',async(req,res,next)=>{try{const s=own(req,res);if(!s)return;if(s.mode!=='direct')return res.status(400).json({error:'NOT_DIRECT_UPLOAD'});s.created=Date.now();const {client}=await clientFor(s.accountId);if(!client.directStatus)return res.status(400).json({error:'DIRECT_UPLOAD_UNSUPPORTED'});res.json(await client.directStatus(s.state));}catch(e:any){if(e?.code==='DIRECT_SESSION_EXPIRED')return res.status(404).json({error:'DIRECT_SESSION_EXPIRED'});next(e);}});
+ async function finish(req:any,res:any,s:Session,remote:DrimeFile){
+  const f=await saveEntry(s.accountId,{id:remote.id,name:remote.name||s.name,file_size:remote.size||s.size,mime:remote.mimeType||s.mime,extension:remote.extension,hash:remote.hash,created_at:remote.createdAt,updated_at:remote.createdAt,type:undefined},s.path);
+  if(remote.thumbnailUrl)await prisma.file.update({where:{id:f.id},data:{thumbnailUrl:remote.thumbnailUrl}});
+@@ -37,15 +69,31 @@ uploadsRouter.post('/direct-complete',async(req,res,next)=>{try{const x=z.object
+  if(s){if(s.userId!==req.userId)return res.status(404).json({error:'UPLOAD_NOT_FOUND'});if(s.mode!=='direct'||s.accountId!==x.accountId||s.name!==name||s.size!==x.size||s.path!==path||s.mime!==mime)return res.status(409).json({error:'UPLOAD_MISMATCH'});}
+  else{const a=await prisma.drimeAccount.findFirst({where:{id:x.accountId,userId:req.userId}});if(!a)return res.status(404).json({error:'ACCOUNT_NOT_FOUND'});if(a.provider!=='GDRIVE')return res.status(400).json({error:'DIRECT_UPLOAD_UNSUPPORTED'});const {client}=await clientFor(a.id);const parentId=await ensureFolder(a.id,client,path);s={id:x.sessionId,userId:req.userId!,accountId:a.id,accountName:a.name,name,mime,size:x.size,path,parentId,mode:'direct',parts:new Map(),created:Date.now()};}
+  if(s.completing)return res.status(409).json({error:'UPLOAD_IN_PROGRESS'});s.completing=true;try{const {client}=await clientFor(s.accountId);if(!client.verifyUploadedFile)return res.status(400).json({error:'DIRECT_UPLOAD_UNSUPPORTED'});const remote=await client.verifyUploadedFile(s.id,s.parentId,s.size,s.name);return await finish(req,res,s,remote);}catch(e:any){s.completing=false;if(e?.code==='DIRECT_UPLOAD_NOT_FOUND')return res.status(409).json({error:'DIRECT_UPLOAD_NOT_READY'});throw e;}}catch(e){next(e);}});
+-uploadsRouter.put('/:id/simple',raw({type:()=>true,limit:SIMPLE+1024}),async(req,res,next)=>{const s=own(req,res);if(!s)return;if(s.simpleInProgress)return res.status(409).json({error:'UPLOAD_IN_PROGRESS'});s.simpleInProgress=true;try{const body=Buffer.isBuffer(req.body)?req.body:Buffer.alloc(0);
++uploadsRouter.put('/:id/simple',raw({type:()=>true,limit:SIMPLE+1024}),async(req,res,next)=>{const s=own(req,res);if(!s)return;s.created=Date.now();if(s.simpleInProgress)return res.status(409).json({error:'UPLOAD_IN_PROGRESS'});s.simpleInProgress=true;try{const body=Buffer.isBuffer(req.body)?req.body:Buffer.alloc(0);
+  const excluded:string[]=[];for(let attempt=0;attempt<6;attempt++){const {client}=await clientFor(s.accountId);
+   try{const remote=await client.uploadSimple(body,s.name,s.mime,s.parentId);return await finish(req,res,s,remote);}
+   catch(e){if(!isCapacityError(e))throw e;await accountManager.block(s.accountId);accountManager.release(s.accountId,BigInt(s.size));excluded.push(s.accountId);if(s.fixed){sessions.delete(s.id);throw Object.assign(new Error(`La cuenta «${s.accountName}» se quedó sin espacio`),{code:'TARGET_FULL'});}const acc=await pick(s.userId,s.size,s.path,undefined,excluded);const c2=await clientFor(acc.id);s.accountId=acc.id;s.accountName=acc.name;s.parentId=await ensureFolder(acc.id,c2.client,s.path);accountManager.reserve(acc.id,BigInt(s.size));}}
+  throw new NoSpaceError();}catch(e:any){if(e?.code==='NO_SPACE_AVAILABLE')return res.status(507).json({error:'NO_SPACE_AVAILABLE',message:'Ninguna cuenta tiene espacio suficiente'});if(['TARGET_NOT_FOUND','TARGET_UNAVAILABLE','TARGET_FULL'].includes(e?.code))return res.status(e.code==='TARGET_NOT_FOUND'?404:507).json({error:e.code,message:e.message});next(e);}finally{if(sessions.has(s.id))s.simpleInProgress=false;}});
+-uploadsRouter.put('/:id/parts/:n',raw({type:()=>true,limit:PART+1024}),async(req,res,next)=>{try{const s=own(req,res);if(!s)return;if(s.mode!=='multipart')return res.status(400).json({error:'NOT_MULTIPART'});const n=Number(req.params.n);if(!Number.isInteger(n)||n<1||n>10000)return res.status(400).json({error:'BAD_PART'});
+- const body=Buffer.isBuffer(req.body)?req.body:Buffer.alloc(0);if(!body.length)return res.status(400).json({error:'EMPTY_PART'});const {client}=await clientFor(s.accountId);const etag=await client.put(s.state,n,body);s.parts.set(n,etag);res.json({ok:true,part:n});}catch(e){const s=sessions.get(req.params.id);if(s&&isCapacityError(e)){await accountManager.block(s.accountId);sessions.delete(s.id);accountManager.release(s.accountId,BigInt(s.size));return res.status(507).json({error:'NO_SPACE_RETRY',message:'La cuenta se llenó durante la subida; reintenta y se usará otra cuenta'});}next(e);}});
++uploadsRouter.put('/:id/parts/:n',raw({type:()=>true,limit:PART+1024}),async(req,res,next)=>{try{const s=own(req,res);if(!s)return;if(s.mode!=='multipart'&&s.mode!=='sharded')return res.status(400).json({error:'NOT_MULTIPART'});const n=Number(req.params.n);if(!Number.isInteger(n)||n<1||n>MAX_PARTS)return res.status(400).json({error:'BAD_PART'});
++ const body=Buffer.isBuffer(req.body)?req.body:Buffer.alloc(0);if(!body.length)return res.status(400).json({error:'EMPTY_PART'});
++ if(s.mode==='sharded'){const start=(n-1)*PART,expected=Math.min(PART,s.size-start);if(start>=s.size||body.length!==expected)return res.status(400).json({error:'BAD_PART_SIZE'});const shard=s.shards!.find(item=>start>=item.offset&&start<item.offset+item.size);if(!shard||start+body.length>shard.offset+shard.size)return res.status(400).json({error:'BAD_PART_BOUNDARY'});const localPart=Math.floor((start-shard.offset)/PART)+1;const {client}=await clientFor(shard.accountId);const etag=await client.put(shard.state,localPart,body);shard.parts.set(localPart,etag);s.parts.set(n,etag);s.created=Date.now();return res.json({ok:true,part:n,account:shard.accountName});}
++ const {client}=await clientFor(s.accountId);const etag=await client.put(s.state,n,body);s.parts.set(n,etag);s.created=Date.now();res.json({ok:true,part:n});}catch(e){const s=sessions.get(req.params.id);if(s&&isCapacityError(e)){const accountId=s.shards?.find(shard=>!shard.remote)?.accountId||s.accountId;await accountManager.block(accountId);await discardSession(s);return res.status(507).json({error:'NO_SPACE_RETRY',message:'Una cuenta se quedó sin espacio. Conecta otra cuenta con capacidad e inicia de nuevo la subida.'});}next(e);}});
++async function finishSharded(req:any,res:any,s:Session){const shards=s.shards||[],expected=Math.max(1,Math.ceil(s.size/PART));if(s.parts.size<expected)return res.status(400).json({error:'MISSING_PARTS',have:s.parts.size,expected});
++ for(const shard of shards){const count=Math.max(1,Math.ceil(shard.size/PART));if(shard.parts.size<count)return res.status(400).json({error:'MISSING_PARTS',have:shard.parts.size,expected:count,account:shard.accountName});}
++ if(s.completing)return res.status(409).json({error:'UPLOAD_IN_PROGRESS'});s.completing=true;
++ try{const manifest:VirtualStorageManifest={version:1,totalSize:s.size,parts:[]};
++  for(const shard of shards){if(!shard.remote){const {client}=await clientFor(shard.accountId);shard.remote=await client.finish(shard.state,[...shard.parts].map(([PartNumber,ETag])=>({PartNumber,ETag})),shard.name,'application/octet-stream',shard.size,null);}
++   if(shard.remote.size&&shard.remote.size!==shard.size)throw new Error('STORAGE_PART_SIZE_MISMATCH');
++   manifest.parts.push({accountId:shard.accountId,drimeFileId:shard.remote.id,downloadUrl:shard.remote.downloadUrl||null,fileName:shard.remote.name||shard.name,offset:shard.offset,size:shard.size});}
++  const marker=encodeVirtualStorage(manifest),extension=s.name.includes('.')?s.name.split('.').pop()!.toLowerCase():null;
++  let file:any;try{file=await prisma.file.create({data:{accountId:s.accountId,drimeFileId:`hcparts-${s.id}`,fileName:s.name,extension,mimeType:s.mime,fileType:detectType({name:s.name,mime:s.mime}),size:BigInt(s.size),folderPath:s.path,thumbnailUrl:null,downloadUrl:marker,uploadedAt:new Date()},include:{tags:{include:{tag:true}},account:{select:{id:true,name:true}}}});}
++  catch(error){await deleteVirtualStorage(marker,s.userId);throw error;}
++  await Promise.all([...new Set(shards.map(shard=>shard.accountId))].map(async accountId=>{try{const {client}=await clientFor(accountId),quota=await client.quota();await accountManager.applyQuota(accountId,quota.totalSpace,quota.usedSpace);}catch(error:any){console.warn('multipart quota refresh',accountId,error?.message||error);}}));
++  sessions.delete(s.id);releaseReservations(s);completedUploads.set(s.id,{userId:s.userId,at:Date.now()});return res.status(201).json(jsonBigInt(withUrl(req,file)));
++ }catch(error:any){s.completing=false;if(isCapacityError(error)){const affected=shards.find(shard=>!shard.remote)?.accountId||s.accountId;await accountManager.block(affected);await discardSession(s);return res.status(507).json({error:'NO_SPACE_RETRY',message:'Una cuenta se quedó sin espacio. Conecta otra cuenta con capacidad e inicia de nuevo la subida.'});}throw error;}}
+ uploadsRouter.post('/:id/complete',async(req,res,next)=>{try{const s=own(req,res);if(!s)return;const expected=Math.max(1,Math.ceil(s.size/PART));if(s.parts.size<expected)return res.status(400).json({error:'MISSING_PARTS',have:s.parts.size,expected});
++ if(s.mode==='sharded')return await finishSharded(req,res,s);
+  if(s.completing)return res.status(409).json({error:'UPLOAD_IN_PROGRESS'});s.completing=true;const {client}=await clientFor(s.accountId);try{const remote=await client.finish(s.state,[...s.parts].map(([PartNumber,ETag])=>({PartNumber,ETag})),s.name,s.mime,s.size,s.parentId);return await finish(req,res,s,remote);}
+  catch(e){s.completing=false;if(isCapacityError(e)){await accountManager.block(s.accountId);sessions.delete(s.id);accountManager.release(s.accountId,BigInt(s.size));return res.status(507).json({error:'NO_SPACE_RETRY',message:'La cuenta se llenó durante la subida; reintenta y se usará otra cuenta'});}throw e;}}catch(e){next(e);}});
+-uploadsRouter.delete('/:id',async(req,res)=>{const s=own(req,res);if(!s)return;sessions.delete(s.id);accountManager.release(s.accountId,BigInt(s.size));if(s.mode==='multipart'||s.mode==='direct'){const {client}=await clientFor(s.accountId);await client.abort(s.state);}res.status(204).end();});
++uploadsRouter.delete('/:id',async(req,res)=>{const s=own(req,res);if(!s)return;await discardSession(s);res.status(204).end();});
+ export {joinPath};
+diff --git a/backend/src/services/virtualStorage.ts b/backend/src/services/virtualStorage.ts
+new file mode 100644
+index 0000000..00e46ae
+--- /dev/null
++++ b/backend/src/services/virtualStorage.ts
+@@ -0,0 +1,161 @@
++import { Readable } from 'node:stream';
++import { prisma } from '../lib.js';
++import { driverFor } from './providers/index.js';
++import type { FileRef, StreamResult } from './providers/common.js';
++import { parseRange } from './providers/common.js';
++
++export const VIRTUAL_STORAGE_PREFIX = 'hcparts:v1:';
++export const INTERNAL_PART_PREFIX = '.hcloud-part-';
++
++export type VirtualStoragePart = {
++  accountId: string;
++  drimeFileId: string;
++  downloadUrl: string | null;
++  fileName: string;
++  offset: number;
++  size: number;
++};
++
++export type VirtualStorageManifest = {
++  version: 1;
++  totalSize: number;
++  parts: VirtualStoragePart[];
++};
++
++export function isVirtualStorage(value: string | null | undefined): boolean {
++  return typeof value === 'string' && value.startsWith(VIRTUAL_STORAGE_PREFIX);
++}
++
++export function isInternalStorageObject(name: string | null | undefined): boolean {
++  return typeof name === 'string' && name.startsWith(INTERNAL_PART_PREFIX);
++}
++
++export function encodeVirtualStorage(manifest: VirtualStorageManifest): string {
++  return VIRTUAL_STORAGE_PREFIX + Buffer.from(JSON.stringify(manifest)).toString('base64url');
++}
++
++export function decodeVirtualStorage(value: string): VirtualStorageManifest {
++  if (!isVirtualStorage(value)) throw new Error('NOT_VIRTUAL_STORAGE');
++  const manifest = JSON.parse(Buffer.from(value.slice(VIRTUAL_STORAGE_PREFIX.length), 'base64url').toString('utf8')) as VirtualStorageManifest;
++  if (manifest.version !== 1 || !Number.isSafeInteger(manifest.totalSize) || manifest.totalSize < 0 || !Array.isArray(manifest.parts)) {
++    throw new Error('INVALID_VIRTUAL_STORAGE_MANIFEST');
++  }
++  let offset = 0;
++  for (const part of manifest.parts) {
++    if (!part.accountId || !part.drimeFileId || !Number.isSafeInteger(part.offset) || !Number.isSafeInteger(part.size) || part.size <= 0 || part.offset !== offset) {
++      throw new Error('INVALID_VIRTUAL_STORAGE_PART');
++    }
++    offset += part.size;
++  }
++  if (offset !== manifest.totalSize) throw new Error('INCOMPLETE_VIRTUAL_STORAGE_MANIFEST');
++  return manifest;
++}
++
++export async function streamVirtualStorage(
++  value: string,
++  ownerId: string,
++  file: { size: bigint; mimeType: string | null },
++  rangeHeader?: string,
++): Promise<StreamResult> {
++  const manifest = decodeVirtualStorage(value);
++  const size = Number(file.size);
++  if (!Number.isSafeInteger(size) || size !== manifest.totalSize) throw new Error('VIRTUAL_STORAGE_SIZE_MISMATCH');
++
++  const requested = rangeHeader ? parseRange(rangeHeader, size) : null;
++  if (rangeHeader && !requested) {
++    return {
++      status: 416,
++      headers: { 'content-range': `bytes */${size}`, 'content-length': '0', 'accept-ranges': 'bytes' },
++      data: Readable.from([]),
++    };
++  }
++  const start = requested?.start ?? 0;
++  const end = requested?.end ?? Math.max(0, size - 1);
++  const accountIds = [...new Set(manifest.parts.map(part => part.accountId))];
++  const accounts = await prisma.drimeAccount.findMany({ where: { id: { in: accountIds }, userId: ownerId } });
++  const accountMap = new Map(accounts.map(account => [account.id, account]));
++  if (accountMap.size !== accountIds.length) throw new Error('VIRTUAL_STORAGE_ACCOUNT_MISSING');
++
++  const data = Readable.from((async function* () {
++    for (const part of manifest.parts) {
++      const partEnd = part.offset + part.size - 1;
++      const from = Math.max(start, part.offset);
++      const to = Math.min(end, partEnd);
++      if (from > to) continue;
++
++      const account = accountMap.get(part.accountId)!;
++      const client = driverFor(account);
++      const ref: FileRef = {
++        drimeFileId: part.drimeFileId,
++        downloadUrl: part.downloadUrl,
++        mimeType: file.mimeType,
++        fileName: part.fileName,
++        size: BigInt(part.size),
++      };
++      const localStart = from - part.offset;
++      const localEnd = to - part.offset;
++      const remote = await client.stream(ref, `bytes=${localStart}-${localEnd}`);
++      if (remote.status >= 400) {
++        remote.data.destroy();
++        throw Object.assign(new Error('VIRTUAL_STORAGE_PART_UNAVAILABLE'), { status: remote.status });
++      }
++
++      // Some providers honor Range and return 206; if one ignores it, discard
++      // the leading bytes locally while still emitting exactly the requested range.
++      let skip = remote.status === 206 || remote.headers['content-range'] ? 0 : localStart;
++      let remaining = to - from + 1;
++      try {
++        for await (const raw of remote.data) {
++          const chunk = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
++          if (skip >= chunk.length) {
++            skip -= chunk.length;
++            continue;
++          }
++          const output = chunk.subarray(skip, Math.min(chunk.length, skip + remaining));
++          skip = 0;
++          if (output.length) {
++            remaining -= output.length;
++            yield output;
++          }
++          if (remaining <= 0) {
++            remote.data.destroy();
++            break;
++          }
++        }
++      } finally {
++        remote.data.destroy();
++      }
++      if (remaining > 0) throw new Error('VIRTUAL_STORAGE_PART_TRUNCATED');
++    }
++  })(), { objectMode: false });
++
++  const length = requested ? requested.end - requested.start + 1 : size;
++  return {
++    status: requested ? 206 : 200,
++    headers: {
++      'content-type': file.mimeType || 'application/octet-stream',
++      'content-length': String(length),
++      'accept-ranges': 'bytes',
++      ...(requested ? { 'content-range': `bytes ${requested.start}-${requested.end}/${size}` } : {}),
++    },
++    data,
++  };
++}
++
++export async function deleteVirtualStorage(value: string, ownerId: string): Promise<void> {
++  const manifest = decodeVirtualStorage(value);
++  const accountIds = [...new Set(manifest.parts.map(part => part.accountId))];
++  const accounts = await prisma.drimeAccount.findMany({ where: { id: { in: accountIds }, userId: ownerId } });
++  const accountMap = new Map(accounts.map(account => [account.id, account]));
++  for (const part of manifest.parts) {
++    const account = accountMap.get(part.accountId);
++    if (!account) continue;
++    try {
++      await driverFor(account).remove(part.drimeFileId, false, true);
++    } catch (error: any) {
++      // Continue removing the remaining pieces; a later account sync can clean
++      // up an orphan if one provider is temporarily unavailable.
++      console.warn('virtual storage cleanup', part.accountId, error?.message || error);
++    }
++  }
++}
+\ No newline at end of file
+diff --git a/backend/src/workers/syncAccount.ts b/backend/src/workers/syncAccount.ts
+index f40cf16..db009fa 100644
+--- a/backend/src/workers/syncAccount.ts
++++ b/backend/src/workers/syncAccount.ts
+@@ -1,4 +1,4 @@
+-import {prisma} from '../lib.js';import {isAccountWithinPlan} from '../services/accountLimits.js';import {Entry,entryHash,thumbOf} from '../services/drimeClient.js';import {driverFor,Driver} from '../services/providers/index.js';import {accountManager} from '../services/accountManager.js';import {isHeartbeat} from '../services/keepalive.js';
++import {prisma} from '../lib.js';import {isAccountWithinPlan} from '../services/accountLimits.js';import {Entry,entryHash,thumbOf} from '../services/drimeClient.js';import {driverFor,Driver} from '../services/providers/index.js';import {accountManager} from '../services/accountManager.js';import {isHeartbeat} from '../services/keepalive.js';import {isInternalStorageObject,isVirtualStorage} from '../services/virtualStorage.js';
+ type FT='IMAGE'|'VIDEO'|'AUDIO'|'DOCUMENT'|'OTHER';
+ const IMG=/^(jpe?g|jfif|pjpeg|png|apng|gif|webp|bmp|dib|svg|avif|heic|heif|heics|heifs|tif?f|jxl|ico|cur|psd|raw|dng|cr2|cr3|nef|nrw|arw|sr2|srf|raf|rw2|orf|pef|x3f|3fr|fff|iiq|mos|mrw|rwl|kdc|dcr|erf|mef|pxn|bay)$/i,VID=/^(mp4|m4v|mov|qt|mkv|webm|ogv|ogg|avi|wmv|flv|f4v|3gp|3g2|mpg|mpeg|m2v|mpv|m2ts|mts|ts|mxf|vob|asf|rm|rmvb|divx|xvid|dv|amv|mpe)$/i,AUD=/^(mp3|wav|ogg|oga|m4a|flac|aac|opus|wma|aiff?|amr|mid|midi)$/i,DOC=/^(pdf|docx?|xlsx?|pptx?|txt|md|csv|tsv|odt|ods|odp|rtf|json|html?|xml|epub|pages|numbers|key)$/i;
+ export function detectType(e:{type?:string;name:string;extension?:string|null;mime?:string|null}):FT{if(e.type==='folder')return 'OTHER';const ext=(e.extension||(e.name.includes('.')?e.name.split('.').pop():'')||'').toLowerCase(),mime=(e.mime||'').toLowerCase();
+@@ -18,8 +18,8 @@ const lastFull=new Map<string,number>();const MIN_FULL:Record<string,number>={GD
+ export async function syncAccount(accountId:string,auto=false){if(running.has(accountId))return -1;running.add(accountId);try{
+  const a=await prisma.drimeAccount.findUniqueOrThrow({where:{id:accountId}});if(!a.isActive)return 0;if(!await isAccountWithinPlan(a.userId,a.id)){console.warn(JSON.stringify({event:'sync_skipped_plan_limit',accountId:a.id,provider:a.provider}));return -3;}if(auto&&Date.now()-(lastFull.get(accountId)||0)<(MIN_FULL[a.provider]??0))return -2;lastFull.set(accountId,Date.now());const client=driverFor(a);const started=new Date();await refreshQuota(a,client);
+  const rows=await prisma.file.findMany({where:{accountId},select:sel});const map=new Map(rows.map(r=>[r.drimeFileId,r as Row]));let writes=0;
+- const seen=await client.listAll(async(e,path)=>{if(isHeartbeat(e.name))return;if(await save(a.id,e,path,map.get(String(e.id))))writes++;});
+- const gone=rows.filter(r=>!seen.has(r.drimeFileId)&&r.uploadedAt<started).map(r=>r.id);
++ const seen=await client.listAll(async(e,path)=>{if(isHeartbeat(e.name)||isInternalStorageObject(e.name))return;if(await save(a.id,e,path,map.get(String(e.id))))writes++;});
++ const gone=rows.filter(r=>!isVirtualStorage(r.downloadUrl)&&!seen.has(r.drimeFileId)&&r.uploadedAt<started).map(r=>r.id);
+  for(let i=0;i<gone.length;i+=500)await prisma.file.deleteMany({where:{id:{in:gone.slice(i,i+500)}}});
+  await prisma.drimeAccount.update({where:{id:a.id},data:{lastSyncedAt:new Date()}});
+  if(writes||gone.length)console.log(`full-sync ${a.name}: ${seen.size} entradas, ${writes} cambios, ${gone.length} eliminadas`);return seen.size;
+@@ -38,7 +38,7 @@ export async function quickSync(accountId:string){
+  for(const e of fEntries){const p=resolve(String(e.id));if(p)paths.set(String(e.id),p);}
+  const ids=[...got.keys()];const rows=await prisma.file.findMany({where:{accountId,drimeFileId:{in:ids}},select:sel});const map=new Map(rows.map(r=>[r.drimeFileId,r as Row]));
+  let writes=0;const renamedFolders:{oldPath:string;newPath:string}[]=[];
+- for(const e of got.values()){if(isHeartbeat(e.name))continue;const p=parentPath(e);if(p===undefined)continue;const old=map.get(String(e.id));
++ for(const e of got.values()){if(isHeartbeat(e.name)||isInternalStorageObject(e.name))continue;const p=parentPath(e);if(p===undefined)continue;const old=map.get(String(e.id));
+   if(e.type==='folder'&&old&&old.mimeType==='folder'){const before=join(old.folderPath,old.fileName),after=join(p,e.name);if(before!==after)renamedFolders.push({oldPath:before,newPath:after});}
+   if(await save(a.id,e,p,old))writes++;}
+  // Al renombrar/mover una carpeta, actualizar la ruta de todo su contenido sin esperar a la sincronización completa.
+diff --git a/frontend/src/hooks/useUpload.ts b/frontend/src/hooks/useUpload.ts
+index e8ca791..46ad0a2 100644
+--- a/frontend/src/hooks/useUpload.ts
++++ b/frontend/src/hooks/useUpload.ts
+@@ -299,7 +299,7 @@ async function runTask(
+       await retry(() => api.put(`/uploads/${task.sessionId}/simple`, task.file, {
+         headers: { 'Content-Type': 'application/octet-stream' },
+         timeout: 0,
+-        onUploadProgress: event => setProgress(Math.min(99, Math.round(event.loaded * 100 / (event.total || task.file.size || 1)))),
++        onUploadProgress: event => setProgress(Math.min(99, Math.round((event.loaded * 100 / (event.total || task.file.size || 1)) * 100) / 100)),
+       }));
+     } else {
+       const size = task.partSize || 8 * 1024 * 1024;
+@@ -314,7 +314,7 @@ async function runTask(
+         await retry(() => api.put(`/uploads/${task.sessionId}/parts/${part}`, chunk, {
+           headers: { 'Content-Type': 'application/octet-stream' },
+           timeout: 0,
+-          onUploadProgress: event => setProgress(Math.min(99, Math.round((sentBefore + event.loaded) * 100 / (task.file.size || 1)))),
++          onUploadProgress: event => setProgress(Math.min(99, Math.round(((sentBefore + event.loaded) * 100 / (task.file.size || 1)) * 100) / 100)),
+         }));
+         sentBefore += chunk.size;
+         complete.add(part);
+diff --git a/frontend/src/lib/uploadQueue.ts b/frontend/src/lib/uploadQueue.ts
+index 2349a63..37179dc 100644
+--- a/frontend/src/lib/uploadQueue.ts
++++ b/frontend/src/lib/uploadQueue.ts
+@@ -7,7 +7,7 @@ export type PersistedUpload = {
+   targetId?: string;
+   batch: string;
+   sessionId?: string;
+-  mode?: 'simple' | 'multipart' | 'direct';
++  mode?: 'simple' | 'multipart' | 'direct' | 'sharded';
+   directUploadUrl?: string;
+   directOffset?: number;
+   accountId?: string;
