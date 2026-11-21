@@ -108,7 +108,7 @@
 +    xhr.setRequestHeader('Content-Range', contentRange);
 +    if (body) xhr.setRequestHeader('Content-Type', mime || 'application/octet-stream');
 +    xhr.responseType = 'text';
-+    xhr.timeout = 0;
++    xhr.timeout = 15 * 60 * 1000;
 +    if (body && onProgress) xhr.upload.onprogress = event => onProgress(event.loaded);
 +    xhr.onload = () => {
 +      if (xhr.status === 308) {
@@ -237,7 +237,7 @@
 -    if (task.mode === 'simple') {
 +    if (task.mode === 'direct') {
 +      if (!task.accountId) throw new Error('No se identificó la cuenta de Google Drive para completar la carga.');
-+      await uploadDirectFile(task, progress => setProgress(Math.min(99, Math.round(progress))));
++      await uploadDirectFile(task, progress => setProgress(Math.min(99, Math.round(progress * 100) / 100)));
 +      await retry(() => api.post('/uploads/direct-complete', {
 +        sessionId: task.sessionId,
 +        accountId: task.accountId,
