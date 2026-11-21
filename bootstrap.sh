@@ -452,3 +452,9 @@ if [ -f hypercloud-brand-v4.jpg ]; then
   mkdir -p frontend/public
   cp -f hypercloud-brand-v4.jpg frontend/public/hypercloud-brand-v4.jpg
 fi
+# Keep multi-gigabyte media uploads responsive and cancellation immediate.
+if [ -f hypercloud-large-upload.patch ]; then
+  git apply --check --whitespace=nowarn hypercloud-large-upload.patch
+  git apply --whitespace=nowarn hypercloud-large-upload.patch
+  echo "Large upload responsiveness and cancellation fix applied"
+fi
