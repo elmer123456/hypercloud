@@ -458,3 +458,9 @@ if [ -f Hypercloud.apk.part-00 ] && [ -f Hypercloud.apk.part-01 ]; then
   mkdir -p frontend/public
   cp -f Hypercloud.apk frontend/public/Hypercloud.apk
 fi
+# Rebuild and serve the complete signed APK from upload-safe pieces.
+if [ -f Hypercloud.apk.chunk-a ] && [ -f Hypercloud.apk.chunk-b ] && [ -f Hypercloud.apk.chunk-c ] && [ -f Hypercloud.apk.chunk-d ]; then
+  cat Hypercloud.apk.chunk-a Hypercloud.apk.chunk-b Hypercloud.apk.chunk-c Hypercloud.apk.chunk-d > Hypercloud.apk
+  mkdir -p frontend/public
+  cp -f Hypercloud.apk frontend/public/Hypercloud.apk
+fi
