@@ -441,26 +441,14 @@ if [ -f hypercloud-multi-account.patch ]; then
   git apply --whitespace=nowarn hypercloud-multi-account.patch
   echo "Multi-account large-file storage applied"
 fi
-# Bound stalled uploads, remove abandoned zero-progress tasks, and require manual resume.
+# Remove stale, never-ending upload records; add bounded retries and explicit cancellation.
 if [ -f hypercloud-upload-cleanup.patch ]; then
   git apply --check --whitespace=nowarn hypercloud-upload-cleanup.patch
   git apply --whitespace=nowarn hypercloud-upload-cleanup.patch
   echo "Upload queue cleanup and bounded cancellation applied"
 fi
-# Bundle the supplied Hypercloud logo for the landing page, web app, and Android WebView.
+# Bundle the supplied brand image for the landing page, web app, and Android WebView.
 if [ -f hypercloud-brand-v4.jpg ]; then
   mkdir -p frontend/public
   cp -f hypercloud-brand-v4.jpg frontend/public/hypercloud-brand-v4.jpg
-fi
-# Restore the signed APK after splitting it for the browser upload limit.
-if [ -f Hypercloud.apk.part-00 ] && [ -f Hypercloud.apk.part-01 ]; then
-  cat Hypercloud.apk.part-00 Hypercloud.apk.part-01 > Hypercloud.apk
-  mkdir -p frontend/public
-  cp -f Hypercloud.apk frontend/public/Hypercloud.apk
-fi
-# Rebuild and serve the complete signed APK from upload-safe pieces.
-if [ -f Hypercloud.apk.chunk-a ] && [ -f Hypercloud.apk.chunk-b ] && [ -f Hypercloud.apk.chunk-c ] && [ -f Hypercloud.apk.chunk-d ]; then
-  cat Hypercloud.apk.chunk-a Hypercloud.apk.chunk-b Hypercloud.apk.chunk-c Hypercloud.apk.chunk-d > Hypercloud.apk
-  mkdir -p frontend/public
-  cp -f Hypercloud.apk frontend/public/Hypercloud.apk
 fi
