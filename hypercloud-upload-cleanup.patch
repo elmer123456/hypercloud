@@ -1,0 +1,361 @@
+diff --git a/frontend/src/components/UploadPanel.tsx b/frontend/src/components/UploadPanel.tsx
+index cf5d595..9967428 100644
+--- a/frontend/src/components/UploadPanel.tsx
++++ b/frontend/src/components/UploadPanel.tsx
+@@ -1,5 +1,6 @@
+ import { useUI } from '../store';
+ import { X, CheckCircle2, AlertCircle, Loader2, RotateCw } from 'lucide-react';
++import { cancelUploadTask } from '../hooks/useUpload';
+ 
+ export function UploadPanel() {
+   const uploads = useUI(state => state.uploads);
+@@ -32,6 +33,13 @@ export function UploadPanel() {
+               <span className="text-xs text-vault-muted">
+                 {upload.status === 'uploading' ? `${upload.progress}%` : upload.status === 'done' ? 'Listo' : upload.status === 'paused' ? 'En pausa' : 'Revisar'}
+               </span>
++              <button
++                type="button"
++                onClick={() => void cancelUploadTask(upload.id)}
++                aria-label={upload.status === 'uploading' ? `Cancelar ${upload.name}` : `Quitar ${upload.name} de la cola`}
++                title={upload.status === 'uploading' ? 'Cancelar subida' : 'Quitar de la cola'}
++                className="rounded-md p-1 text-vault-muted hover:bg-white/10 hover:text-white"
++              ><X size={14}/></button>
+             </div>
+             {upload.status === 'uploading' && <div className="mt-1.5 h-1.5 rounded-full bg-white/10" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={upload.progress} aria-label={`Subida de ${upload.name}`}><div className="h-full rounded-full bg-vault-primary transition-[width]" style={{ width: `${upload.progress}%` }}/></div>}
+             {upload.error && <p className="mt-1 text-xs leading-5 text-amber-200/80">{upload.error}</p>}
+diff --git a/frontend/src/hooks/useUpload.ts b/frontend/src/hooks/useUpload.ts
+index 46ad0a2..7f2db3d 100644
+--- a/frontend/src/hooks/useUpload.ts
++++ b/frontend/src/hooks/useUpload.ts
+@@ -8,34 +8,49 @@ import { listUploadTasks, removeUploadTask, saveUploadTask, type PersistedUpload
+ export type UploadItem = { file: File; dir: string };
+ type UploadInput = FileList | File[] | UploadItem[] | AsyncIterable<UploadItem>;
+ const CONCURRENCY = 2;
+-const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
++const sleep = (ms: number, signal?: AbortSignal) => new Promise<void>((resolve, reject) => {
++  if (signal?.aborted) return reject(new DOMException('Carga cancelada.', 'AbortError'));
++  const timer = window.setTimeout(() => { cleanup(); resolve(); }, ms);
++  const onAbort = () => { window.clearTimeout(timer); cleanup(); reject(new DOMException('Carga cancelada.', 'AbortError')); };
++  const cleanup = () => signal?.removeEventListener('abort', onAbort);
++  signal?.addEventListener('abort', onAbort, { once: true });
++});
+ const activeTasks = new Set<string>();
++const activeControllers = new Map<string, AbortController>();
++const UPLOAD_REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
++const CONTROL_REQUEST_TIMEOUT_MS = 60 * 1000;
+ const PROGRESS_INTERVAL = 180;
+ const DIRECT_CHUNK_SIZE = 32 * 1024 * 1024;
+ 
+-async function retry<T>(fn: () => Promise<T>, times = 4): Promise<T> {
++async function retry<T>(fn: () => Promise<T>, times = 2, signal?: AbortSignal): Promise<T> {
+   for (let i = 0; ; i += 1) {
+     try { return await fn(); }
+     catch (e: any) {
++      if (signal?.aborted) throw e;
+       const status = e?.response?.status;
+       if (i >= times || (status && status < 500 && status !== 429 && status !== 408)) throw e;
+-      await sleep(1000 * 2 ** i);
++      await sleep(1000 * 2 ** i, signal);
+     }
+   }
+ }
+ 
+ type DrivePutResult = { done: boolean; offset: number | null };
+ 
+-function drivePut(url: string, body: Blob | null, contentRange: string, mime: string, onProgress?: (loaded: number) => void): Promise<DrivePutResult> {
++function drivePut(url: string, body: Blob | null, contentRange: string, mime: string, onProgress?: (loaded: number) => void, signal?: AbortSignal): Promise<DrivePutResult> {
+   return new Promise((resolve, reject) => {
+     const xhr = new XMLHttpRequest();
++    if (signal?.aborted) return reject(new DOMException('Carga cancelada.', 'AbortError'));
+     xhr.open('PUT', url);
+     xhr.setRequestHeader('Content-Range', contentRange);
+     if (body) xhr.setRequestHeader('Content-Type', mime || 'application/octet-stream');
+     xhr.responseType = 'text';
+-    xhr.timeout = 15 * 60 * 1000;
++    xhr.timeout = 5 * 60 * 1000;
+     if (body && onProgress) xhr.upload.onprogress = event => onProgress(event.loaded);
++    const cleanup = () => signal?.removeEventListener('abort', onAbort);
++    const onAbort = () => xhr.abort();
++    signal?.addEventListener('abort', onAbort, { once: true });
+     xhr.onload = () => {
++      cleanup();
+       if (xhr.status === 308) {
+         const match = /bytes=0-(\d+)/i.exec(xhr.getResponseHeader('Range') || '');
+         resolve({ done: false, offset: match ? Number(match[1]) + 1 : null });
+@@ -49,23 +64,26 @@ function drivePut(url: string, body: Blob | null, contentRange: string, mime: st
+       }
+     };
+     xhr.onerror = () => {
++      cleanup();
+       const error: any = new Error('Se interrumpió la conexión con Google Drive.');
+       error.response = { status: 0, data: {} };
+       reject(error);
+     };
+     xhr.ontimeout = () => {
++      cleanup();
+       const error: any = new Error('La carga a Google Drive agotó el tiempo de espera.');
+       error.response = { status: 0, data: {} };
+       reject(error);
+     };
++    xhr.onabort = () => { cleanup(); reject(new DOMException('Carga cancelada.', 'AbortError')); };
+     xhr.send(body);
+   });
+ }
+ 
+-async function driveOffset(task: PersistedUpload, size: number, fallback: number): Promise<number> {
++async function driveOffset(task: PersistedUpload, size: number, fallback: number, signal?: AbortSignal): Promise<number> {
+   if (!task.sessionId) throw new Error('Falta la sesión de Hypercloud para consultar el avance.');
+   try {
+-    const { data } = await api.get(`/uploads/${task.sessionId}/direct-status`);
++    const { data } = await api.get(`/uploads/${task.sessionId}/direct-status`, { signal, timeout: CONTROL_REQUEST_TIMEOUT_MS });
+     return data.done ? size : Math.max(0, Math.min(size, Number(data.offset ?? fallback)));
+   } catch (error: any) {
+     if (error?.response?.status === 404) {
+@@ -76,10 +94,10 @@ async function driveOffset(task: PersistedUpload, size: number, fallback: number
+   }
+ }
+ 
+-async function uploadDirectFile(task: PersistedUpload, onProgress: (progress: number) => void): Promise<void> {
++async function uploadDirectFile(task: PersistedUpload, onProgress: (progress: number) => void, signal?: AbortSignal): Promise<void> {
+   const url = task.directUploadUrl;
+   if (!url) throw new Error('Falta la sesión directa de Google Drive; vuelve a iniciar la carga.');
+-  let offset = await driveOffset(task, task.file.size, task.directOffset || 0);
++  let offset = await driveOffset(task, task.file.size, task.directOffset || 0, signal);
+   onProgress(task.file.size ? offset * 100 / task.file.size : 100);
+   let failures = 0;
+   while (offset < task.file.size) {
+@@ -92,16 +110,17 @@ async function uploadDirectFile(task: PersistedUpload, onProgress: (progress: nu
+         `bytes ${start}-${end - 1}/${task.file.size}`,
+         task.file.type || 'application/octet-stream',
+         loaded => onProgress(Math.min(99, (start + loaded) * 100 / (task.file.size || 1))),
++        signal,
+       );
+-      offset = result.done ? task.file.size : await driveOffset(task, task.file.size, result.offset ?? end);
++      offset = result.done ? task.file.size : await driveOffset(task, task.file.size, result.offset ?? end, signal);
+       if (offset <= start) throw new Error('Google Drive no confirmó el avance de la carga.');
+       failures = 0;
+     } catch (error: any) {
+-      if (error?.code === 'DIRECT_SESSION_EXPIRED') throw error;
++      if (signal?.aborted || error?.code === 'DIRECT_SESSION_EXPIRED') throw error;
+       if (failures >= 4) throw error;
+       failures += 1;
+-      await sleep(1000 * 2 ** (failures - 1));
+-      offset = await driveOffset(task, task.file.size, offset);
++      await sleep(1000 * 2 ** (failures - 1), signal);
++      offset = await driveOffset(task, task.file.size, offset, signal);
+       if (offset >= task.file.size) break;
+     }
+     task.directOffset = offset;
+@@ -178,6 +197,9 @@ async function runTask(
+ ) {
+   if (activeTasks.has(task.id)) return false;
+   activeTasks.add(task.id);
++  const controller = new AbortController();
++  activeControllers.set(task.id, controller);
++  const signal = controller.signal;
+   let lastProgressAt = 0;
+   let lastProgress = 0;
+   let displayAccount = '';
+@@ -202,7 +224,7 @@ async function runTask(
+     let status: any;
+     if (task.sessionId) {
+       try {
+-        status = (await api.get(`/uploads/${task.sessionId}`)).data;
++        status = (await api.get(`/uploads/${task.sessionId}`, { signal, timeout: CONTROL_REQUEST_TIMEOUT_MS })).data;
+         if (status.status === 'complete') {
+           await removeUploadTask(task.id).catch(() => {});
+           setUpload({ id: task.id, name: task.name, progress: 100, status: 'done' });
+@@ -211,8 +233,8 @@ async function runTask(
+         }
+         if (status.inProgress && status.mode === 'simple') {
+           for (let check = 0; check < 15; check += 1) {
+-            await sleep(1000);
+-            status = (await api.get(`/uploads/${task.sessionId}`)).data;
++            await sleep(1000, signal);
++            status = (await api.get(`/uploads/${task.sessionId}`, { signal, timeout: CONTROL_REQUEST_TIMEOUT_MS })).data;
+             if (status.status === 'complete') {
+               await removeUploadTask(task.id).catch(() => {});
+               setUpload({ id: task.id, name: task.name, progress: 100, status: 'done' });
+@@ -247,7 +269,7 @@ async function runTask(
+         path: [task.basePath === '/' ? '' : task.basePath, task.dir].filter(Boolean).join('/') || '/',
+         batch: task.batch,
+         accountId: task.targetId || undefined,
+-      }))).data;
++      }, { signal, timeout: CONTROL_REQUEST_TIMEOUT_MS }), 2, signal)).data;
+       task.sessionId = status.id;
+       task.mode = status.mode;
+       task.partSize = status.partSize;
+@@ -273,7 +295,7 @@ async function runTask(
+ 
+     if (task.mode === 'direct') {
+       if (!task.accountId) throw new Error('No se identificó la cuenta de Google Drive para completar la carga.');
+-      await uploadDirectFile(task, progress => setProgress(Math.min(99, Math.round(progress * 100) / 100)));
++      await uploadDirectFile(task, progress => setProgress(Math.min(99, Math.round(progress * 100) / 100)), signal);
+       await retry(() => api.post('/uploads/direct-complete', {
+         sessionId: task.sessionId,
+         accountId: task.accountId,
+@@ -281,10 +303,10 @@ async function runTask(
+         size: task.file.size,
+         mime: task.file.type || undefined,
+         path: [task.basePath === '/' ? '' : task.basePath, task.dir].filter(Boolean).join('/') || '/',
+-      }, { timeout: 0 }), 2);
++      }, { signal, timeout: CONTROL_REQUEST_TIMEOUT_MS }), 2, signal);
+     } else if (task.mode === 'simple') {
+       // A short file-picker/app interruption does not force a restart; send again only if the server confirms no active request.
+-      status = (await api.get(`/uploads/${task.sessionId}`)).data;
++      status = (await api.get(`/uploads/${task.sessionId}`, { signal, timeout: CONTROL_REQUEST_TIMEOUT_MS })).data;
+       if (status.status === 'complete') {
+         await removeUploadTask(task.id).catch(() => {});
+         setUpload({ id: task.id, name: task.name, progress: 100, status: 'done' });
+@@ -298,9 +320,10 @@ async function runTask(
+       }
+       await retry(() => api.put(`/uploads/${task.sessionId}/simple`, task.file, {
+         headers: { 'Content-Type': 'application/octet-stream' },
+-        timeout: 0,
++        signal,
++        timeout: UPLOAD_REQUEST_TIMEOUT_MS,
+         onUploadProgress: event => setProgress(Math.min(99, Math.round((event.loaded * 100 / (event.total || task.file.size || 1)) * 100) / 100)),
+-      }));
++      }), 2, signal);
+     } else {
+       const size = task.partSize || 8 * 1024 * 1024;
+       const totalParts = task.parts || Math.max(1, Math.ceil(task.file.size / size));
+@@ -313,16 +336,17 @@ async function runTask(
+         const chunk = task.file.slice((part - 1) * size, Math.min(task.file.size, part * size));
+         await retry(() => api.put(`/uploads/${task.sessionId}/parts/${part}`, chunk, {
+           headers: { 'Content-Type': 'application/octet-stream' },
+-          timeout: 0,
++          signal,
++          timeout: UPLOAD_REQUEST_TIMEOUT_MS,
+           onUploadProgress: event => setProgress(Math.min(99, Math.round(((sentBefore + event.loaded) * 100 / (task.file.size || 1)) * 100) / 100)),
+-        }));
++        }), 2, signal);
+         sentBefore += chunk.size;
+         complete.add(part);
+         task.completedParts = [...complete];
+         task.state = 'queued';
+         await saveUploadTask(task);
+       }
+-      await retry(() => api.post(`/uploads/${task.sessionId}/complete`, {}, { timeout: 0 }), 2);
++      await retry(() => api.post(`/uploads/${task.sessionId}/complete`, {}, { signal, timeout: CONTROL_REQUEST_TIMEOUT_MS }), 2, signal);
+     }
+ 
+     await removeUploadTask(task.id).catch(() => {});
+@@ -330,6 +354,12 @@ async function runTask(
+     invalidateFiles(queryClient);
+     return true;
+   } catch (error: any) {
++    if (signal.aborted) {
++      if (task.sessionId) await api.delete(`/uploads/${task.sessionId}`, { timeout: CONTROL_REQUEST_TIMEOUT_MS }).catch(() => {});
++      await removeUploadTask(task.id).catch(() => {});
++      useUI.getState().removeUpload(task.id);
++      return false;
++    }
+     if (isLostUploadSession(error) && task.sessionId && (task.sessionRestarts || 0) < 2) {
+       task.sessionRestarts = (task.sessionRestarts || 0) + 1;
+       task.sessionId = undefined;
+@@ -368,7 +398,7 @@ async function runTask(
+       setUpload({
+         id: task.id,
+         name: task.name,
+-        progress: 0,
++        progress: lastProgress,
+         status: 'error',
+         error: 'La cuenta de destino dejó de estar disponible. El archivo no se envió; elige otra cuenta y vuelve a seleccionarlo.',
+       });
+@@ -377,11 +407,22 @@ async function runTask(
+     const message = errorMessage(error);
+     const state = isTemporaryFailure(error) ? 'paused' : 'error';
+     await setTaskState(state, message);
+-    setUpload({ id: task.id, name: displayAccount ? `${task.name} → ${displayAccount}` : task.name, progress: 0, status: state, error: message });
++    setUpload({ id: task.id, name: displayAccount ? `${task.name} → ${displayAccount}` : task.name, progress: lastProgress, status: state, error: message });
+     return false;
+   } finally {
+     activeTasks.delete(task.id);
++    activeControllers.delete(task.id);
++  }
++}
++
++export async function cancelUploadTask(id: string): Promise<void> {
++  activeControllers.get(id)?.abort();
++  const task = (await listUploadTasks().catch(() => [])).find(item => item.id === id);
++  if (task?.sessionId) {
++    await api.delete(`/uploads/${task.sessionId}`, { timeout: CONTROL_REQUEST_TIMEOUT_MS }).catch(() => {});
+   }
++  await removeUploadTask(id).catch(() => {});
++  useUI.getState().removeUpload(id);
+ }
+ 
+ async function runInBatches(
+@@ -465,30 +506,44 @@ export function useResumePendingUploads() {
+   const setUpload = useUI(state => state.setUpload);
+   useEffect(() => {
+     let mounted = true;
+-    const resume = async (includeErrors = false) => {
++    const hydrateQueue = async () => {
+       try {
+-        const tasks = (await listUploadTasks()).filter(task => task.state === 'queued' || task.state === 'paused' || (includeErrors && task.state === 'error'));
+-        if (!mounted || !tasks.length) return;
+-        await runInBatches(tasks, queryClient, setUpload);
++        let tasks = await listUploadTasks();
++        const migrationKey = 'hypercloud-upload-queue-cleanup-v1';
++        if (!localStorage.getItem(migrationKey)) {
++          const abandoned = tasks.filter(task => task.completedParts.length === 0 && !(task.mode === 'direct' && (task.directOffset || 0) > 0));
++          for (const task of abandoned) {
++            if (task.sessionId) await api.delete(`/uploads/${task.sessionId}`, { timeout: CONTROL_REQUEST_TIMEOUT_MS }).catch(() => {});
++            await removeUploadTask(task.id).catch(() => {});
++            useUI.getState().removeUpload(task.id);
++          }
++          try { localStorage.setItem(migrationKey, '1'); } catch {}
++          tasks = tasks.filter(task => !abandoned.some(item => item.id === task.id));
++        }
++        if (!mounted) return;
++        for (const task of tasks) {
++          const bytesDone = task.mode === 'direct'
++            ? Math.max(0, task.directOffset || 0)
++            : task.completedParts.reduce((sum, part) => sum + Math.min(task.partSize || 8 * 1024 * 1024, Math.max(0, task.file.size - (part - 1) * (task.partSize || 8 * 1024 * 1024))), 0);
++          const progress = task.file.size ? Math.min(99, Math.round(bytesDone * 10000 / task.file.size) / 100) : 0;
++          task.state = 'paused';
++          await saveUploadTask(task).catch(() => {});
++          setUpload({ id: task.id, name: task.name, progress, status: 'paused', error: task.error || 'Carga pausada. Reanúdala manualmente cuando quieras.' });
++        }
+       } catch {
+         // Local browser storage may be disabled; ongoing uploads still work in the active session.
+       }
+     };
+-    void resume(false);
+-    const onOnline = () => { void resume(false); };
+-    const onManualResume = () => { void resume(true); };
+-    const onForeground = () => {
+-      if (document.visibilityState === 'visible') void resume(false);
++    void hydrateQueue();
++    const onManualResume = async () => {
++      try {
++        const tasks = (await listUploadTasks()).filter(task => task.state === 'queued' || task.state === 'paused' || task.state === 'error');
++        if (mounted && tasks.length) await runInBatches(tasks, queryClient, setUpload);
++      } catch {}
+     };
+-    window.addEventListener('online', onOnline);
+-    window.addEventListener('pageshow', onForeground);
+-    document.addEventListener('visibilitychange', onForeground);
+     window.addEventListener('hypercloud-resume-uploads', onManualResume);
+     return () => {
+       mounted = false;
+-      window.removeEventListener('online', onOnline);
+-      window.removeEventListener('pageshow', onForeground);
+-      document.removeEventListener('visibilitychange', onForeground);
+       window.removeEventListener('hypercloud-resume-uploads', onManualResume);
+     };
+   }, [queryClient, setUpload]);
+diff --git a/frontend/src/store/index.ts b/frontend/src/store/index.ts
+index c31a2ca..2466710 100644
+--- a/frontend/src/store/index.ts
++++ b/frontend/src/store/index.ts
+@@ -1,5 +1,5 @@
+ import {create} from 'zustand';
+ import {detectTvDisplay} from '../lib/displayMode';
+ type Upload={id:string;name:string;progress:number;status:'uploading'|'paused'|'done'|'error';error?:string};
+-type State={sidebar:boolean;viewer:any|null;uploads:Upload[];toggleSidebar:()=>void;setViewer:(x:any|null)=>void;setUpload:(u:Upload)=>void;clearUploads:()=>void;uploadTarget:string;setUploadTarget:(id:string)=>void};
+-export const useUI=create<State>(set=>({sidebar:typeof window==='undefined'?true:detectTvDisplay()?false:window.innerWidth<768?false:localStorage.getItem('sidebar')!=='0',viewer:null,uploads:[],uploadTarget:(typeof window!=='undefined'&&localStorage.getItem('uploadTarget'))||'',setUploadTarget:id=>{try{localStorage.setItem('uploadTarget',id);}catch{}set({uploadTarget:id});},toggleSidebar:()=>set(s=>{const v=!s.sidebar;try{if(window.innerWidth>=768)localStorage.setItem('sidebar',v?'1':'0');}catch{}return{sidebar:v};}),setViewer:viewer=>set({viewer}),setUpload:u=>set(s=>({uploads:[...s.uploads.filter(x=>x.id!==u.id),u].slice(-100)})),clearUploads:()=>set(s=>({uploads:s.uploads.filter(u=>u.status==='uploading'||u.status==='paused')}))}));
++type State={sidebar:boolean;viewer:any|null;uploads:Upload[];toggleSidebar:()=>void;setViewer:(x:any|null)=>void;setUpload:(u:Upload)=>void;clearUploads:()=>void;removeUpload:(id:string)=>void;uploadTarget:string;setUploadTarget:(id:string)=>void};
++export const useUI=create<State>(set=>({sidebar:typeof window==='undefined'?true:detectTvDisplay()?false:window.innerWidth<768?false:localStorage.getItem('sidebar')!=='0',viewer:null,uploads:[],uploadTarget:(typeof window!=='undefined'&&localStorage.getItem('uploadTarget'))||'',setUploadTarget:id=>{try{localStorage.setItem('uploadTarget',id);}catch{}set({uploadTarget:id});},toggleSidebar:()=>set(s=>{const v=!s.sidebar;try{if(window.innerWidth>=768)localStorage.setItem('sidebar',v?'1':'0');}catch{}return{sidebar:v};}),setViewer:viewer=>set({viewer}),setUpload:u=>set(s=>({uploads:[...s.uploads.filter(x=>x.id!==u.id),u].slice(-100)})),clearUploads:()=>set(s=>({uploads:s.uploads.filter(u=>u.status==='uploading'||u.status==='paused')})),removeUpload:id=>set(s=>({uploads:s.uploads.filter(u=>u.id!==id)}))}));
