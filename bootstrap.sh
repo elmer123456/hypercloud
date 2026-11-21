@@ -435,3 +435,9 @@ if [ -f hypercloud-direct-drive.patch ]; then
   git apply --whitespace=nowarn hypercloud-direct-drive.patch
   echo "Direct Google Drive upload patch applied"
 fi
+# Distributed large-file upload across linked cloud accounts with virtual range playback.
+if [ -f hypercloud-multi-account.patch ]; then
+  git apply --check --whitespace=nowarn hypercloud-multi-account.patch
+  git apply --whitespace=nowarn hypercloud-multi-account.patch
+  echo "Multi-account large-file storage applied"
+fi
