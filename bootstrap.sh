@@ -441,3 +441,14 @@ if [ -f hypercloud-multi-account.patch ]; then
   git apply --whitespace=nowarn hypercloud-multi-account.patch
   echo "Multi-account large-file storage applied"
 fi
+# Bound stalled uploads, remove abandoned zero-progress tasks, and require manual resume.
+if [ -f hypercloud-upload-cleanup.patch ]; then
+  git apply --check --whitespace=nowarn hypercloud-upload-cleanup.patch
+  git apply --whitespace=nowarn hypercloud-upload-cleanup.patch
+  echo "Upload queue cleanup and bounded cancellation applied"
+fi
+# Bundle the supplied Hypercloud logo for the landing page, web app, and Android WebView.
+if [ -f hypercloud-brand-v4.jpg ]; then
+  mkdir -p frontend/public
+  cp -f hypercloud-brand-v4.jpg frontend/public/hypercloud-brand-v4.jpg
+fi
