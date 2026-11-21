@@ -452,3 +452,9 @@ if [ -f hypercloud-brand-v4.jpg ]; then
   mkdir -p frontend/public
   cp -f hypercloud-brand-v4.jpg frontend/public/hypercloud-brand-v4.jpg
 fi
+# Restore the signed APK after splitting it for the browser upload limit.
+if [ -f Hypercloud.apk.part-00 ] && [ -f Hypercloud.apk.part-01 ]; then
+  cat Hypercloud.apk.part-00 Hypercloud.apk.part-01 > Hypercloud.apk
+  mkdir -p frontend/public
+  cp -f Hypercloud.apk frontend/public/Hypercloud.apk
+fi
