@@ -21,7 +21,7 @@ index 9967428..bc20a90 100644
    );
  }
 diff --git a/frontend/src/hooks/useUpload.ts b/frontend/src/hooks/useUpload.ts
-index 7f2db3d..17e8f0a 100644
+index 7f2db3d..f9a06cc 100644
 --- a/frontend/src/hooks/useUpload.ts
 +++ b/frontend/src/hooks/useUpload.ts
 @@ -17,6 +17,13 @@ const sleep = (ms: number, signal?: AbortSignal) => new Promise<void>((resolve,
@@ -38,7 +38,72 @@ index 7f2db3d..17e8f0a 100644
  const UPLOAD_REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
  const CONTROL_REQUEST_TIMEOUT_MS = 60 * 1000;
  const PROGRESS_INTERVAL = 180;
-@@ -112,7 +119,7 @@ async function uploadDirectFile(task: PersistedUpload, onProgress: (progress: nu
+@@ -94,6 +101,64 @@ async function driveOffset(task: PersistedUpload, size: number, fallback: number
+   }
+ }
+ 
++async function completeDirectUpload(task: PersistedUpload, signal?: AbortSignal): Promise<void> {
++  if (!task.sessionId || !task.accountId) throw new Error('No se pudo identificar la sesión de Drive para finalizar la carga.');
++  const payload = {
++    sessionId: task.sessionId,
++    accountId: task.accountId,
++    name: task.file.name,
++    size: task.file.size,
++    mime: task.file.type || undefined,
++    path: [task.basePath === '/' ? '' : task.basePath, task.dir].filter(Boolean).join('/') || '/',
++  };
++  const deadline = Date.now() + 3 * 60 * 1000;
++  let delay = 500;
++  let lastError: any;
++
++  while (Date.now() < deadline) {
++    if (signal?.aborted) throw new DOMException('Carga cancelada.', 'AbortError');
++
++    try {
++      const { data: current } = await api.get(`/uploads/${task.sessionId}`, { signal, timeout: CONTROL_REQUEST_TIMEOUT_MS });
++      if (current.status === 'complete') return;
++      if (current.inProgress) {
++        await sleep(delay, signal);
++        delay = Math.min(5000, Math.round(delay * 1.6));
++        continue;
++      }
++    } catch (error: any) {
++      const status = error?.response?.status;
++      if (status !== 404 && status !== 408 && status !== 429 && !(status >= 500) && status) throw error;
++      lastError = error;
++    }
++
++    try {
++      const { data: result } = await api.post('/uploads/direct-complete', payload, { signal, timeout: CONTROL_REQUEST_TIMEOUT_MS });
++      if (result?.status !== 'processing') return;
++    } catch (error: any) {
++      const status = error?.response?.status;
++      const code = error?.response?.data?.error;
++      const pending = status === 409 && (code === 'DIRECT_UPLOAD_NOT_READY' || code === 'UPLOAD_IN_PROGRESS');
++      const transient = !status || status === 408 || status === 429 || status >= 500;
++      if (!pending && !transient) {
++        if (status === 409 && code === 'UPLOAD_MISMATCH') {
++          error.message = 'Drive recibió el archivo, pero Hypercloud no pudo verificar sus datos. No vuelvas a subirlo todavía; conserva esta tarea para reintentar.';
++        }
++        throw error;
++      }
++      lastError = error;
++    }
++
++    await sleep(delay, signal);
++    delay = Math.min(5000, Math.round(delay * 1.6));
++  }
++
++  const error = new Error('Google Drive confirmó la carga, pero Hypercloud sigue registrando el archivo. La tarea queda guardada para reanudar; no vuelvas a seleccionarlo ni subirlo.');
++  (error as any).response = { status: 408, data: { error: 'DIRECT_UPLOAD_FINALIZING', message: error.message } };
++  (error as any).cause = lastError;
++  throw error;
++}
++
+ async function uploadDirectFile(task: PersistedUpload, onProgress: (progress: number) => void, signal?: AbortSignal): Promise<void> {
+   const url = task.directUploadUrl;
+   if (!url) throw new Error('Falta la sesión directa de Google Drive; vuelve a iniciar la carga.');
+@@ -112,7 +177,7 @@ async function uploadDirectFile(task: PersistedUpload, onProgress: (progress: nu
          loaded => onProgress(Math.min(99, (start + loaded) * 100 / (task.file.size || 1))),
          signal,
        );
@@ -47,7 +112,7 @@ index 7f2db3d..17e8f0a 100644
        if (offset <= start) throw new Error('Google Drive no confirmó el avance de la carga.');
        failures = 0;
      } catch (error: any) {
-@@ -124,7 +131,7 @@ async function uploadDirectFile(task: PersistedUpload, onProgress: (progress: nu
+@@ -124,7 +189,7 @@ async function uploadDirectFile(task: PersistedUpload, onProgress: (progress: nu
        if (offset >= task.file.size) break;
      }
      task.directOffset = offset;
@@ -56,7 +121,7 @@ index 7f2db3d..17e8f0a 100644
      onProgress(task.file.size ? offset * 100 / task.file.size : 100);
    }
  }
-@@ -193,12 +200,14 @@ function invalidateFiles(queryClient: ReturnType<typeof useQueryClient>) {
+@@ -193,12 +258,14 @@ function invalidateFiles(queryClient: ReturnType<typeof useQueryClient>) {
  async function runTask(
    task: PersistedUpload,
    queryClient: ReturnType<typeof useQueryClient>,
@@ -72,7 +137,7 @@ index 7f2db3d..17e8f0a 100644
    const signal = controller.signal;
    let lastProgressAt = 0;
    let lastProgress = 0;
-@@ -211,14 +220,14 @@ async function runTask(
+@@ -211,14 +278,14 @@ async function runTask(
      }
      lastProgressAt = now;
      lastProgress = progress;
@@ -90,7 +155,7 @@ index 7f2db3d..17e8f0a 100644
  
    try {
      let status: any;
-@@ -256,7 +265,7 @@ async function runTask(
+@@ -256,7 +323,7 @@ async function runTask(
            task.accountId = undefined;
            task.accountName = undefined;
            task.completedParts = [];
@@ -99,7 +164,7 @@ index 7f2db3d..17e8f0a 100644
          }
        }
      }
-@@ -271,6 +280,7 @@ async function runTask(
+@@ -271,6 +338,7 @@ async function runTask(
          accountId: task.targetId || undefined,
        }, { signal, timeout: CONTROL_REQUEST_TIMEOUT_MS }), 2, signal)).data;
        task.sessionId = status.id;
@@ -107,7 +172,7 @@ index 7f2db3d..17e8f0a 100644
        task.mode = status.mode;
        task.partSize = status.partSize;
        task.parts = status.parts;
-@@ -282,7 +292,7 @@ async function runTask(
+@@ -282,7 +350,7 @@ async function runTask(
        displayAccount = status.account?.name || '';
        task.state = 'queued';
        task.error = undefined;
@@ -116,15 +181,25 @@ index 7f2db3d..17e8f0a 100644
      } else {
        displayAccount = status?.account?.name || task.accountName || displayAccount;
        task.mode = status?.mode || task.mode;
-@@ -295,6 +305,7 @@ async function runTask(
+@@ -295,15 +363,9 @@ async function runTask(
  
      if (task.mode === 'direct') {
        if (!task.accountId) throw new Error('No se identificó la cuenta de Google Drive para completar la carga.');
 +      setUpload({ id: task.id, name: displayAccount ? `${task.name} → ${displayAccount}` : task.name, progress: lastProgress, status: 'uploading', phase: 'sending' });
        await uploadDirectFile(task, progress => setProgress(Math.min(99, Math.round(progress * 100) / 100)), signal);
-       await retry(() => api.post('/uploads/direct-complete', {
-         sessionId: task.sessionId,
-@@ -318,6 +329,7 @@ async function runTask(
+-      await retry(() => api.post('/uploads/direct-complete', {
+-        sessionId: task.sessionId,
+-        accountId: task.accountId,
+-        name: task.file.name,
+-        size: task.file.size,
+-        mime: task.file.type || undefined,
+-        path: [task.basePath === '/' ? '' : task.basePath, task.dir].filter(Boolean).join('/') || '/',
+-      }, { signal, timeout: CONTROL_REQUEST_TIMEOUT_MS }), 2, signal);
++      await completeDirectUpload(task, signal);
+     } else if (task.mode === 'simple') {
+       // A short file-picker/app interruption does not force a restart; send again only if the server confirms no active request.
+       status = (await api.get(`/uploads/${task.sessionId}`, { signal, timeout: CONTROL_REQUEST_TIMEOUT_MS })).data;
+@@ -318,6 +380,7 @@ async function runTask(
          setUpload({ id: task.id, name: task.name, progress: 0, status: 'paused', error: task.error });
          return false;
        }
@@ -132,7 +207,7 @@ index 7f2db3d..17e8f0a 100644
        await retry(() => api.put(`/uploads/${task.sessionId}/simple`, task.file, {
          headers: { 'Content-Type': 'application/octet-stream' },
          signal,
-@@ -329,8 +341,9 @@ async function runTask(
+@@ -329,8 +392,9 @@ async function runTask(
        const totalParts = task.parts || Math.max(1, Math.ceil(task.file.size / size));
        const complete = new Set<number>((status?.completedParts || task.completedParts || []).map(Number));
        task.completedParts = [...complete];
@@ -143,7 +218,7 @@ index 7f2db3d..17e8f0a 100644
        for (let part = 1; part <= totalParts; part += 1) {
          if (complete.has(part)) continue;
          const chunk = task.file.slice((part - 1) * size, Math.min(task.file.size, part * size));
-@@ -344,7 +357,7 @@ async function runTask(
+@@ -344,7 +408,7 @@ async function runTask(
          complete.add(part);
          task.completedParts = [...complete];
          task.state = 'queued';
@@ -152,7 +227,7 @@ index 7f2db3d..17e8f0a 100644
        }
        await retry(() => api.post(`/uploads/${task.sessionId}/complete`, {}, { signal, timeout: CONTROL_REQUEST_TIMEOUT_MS }), 2, signal);
      }
-@@ -412,17 +425,25 @@ async function runTask(
+@@ -412,17 +476,25 @@ async function runTask(
    } finally {
      activeTasks.delete(task.id);
      activeControllers.delete(task.id);
@@ -184,7 +259,7 @@ index 7f2db3d..17e8f0a 100644
  }
  
  async function runInBatches(
-@@ -486,9 +507,9 @@ export function useUpload() {
+@@ -486,9 +558,9 @@ export function useUpload() {
          const index = nextIndex++;
          tasks.push(task);
          // Surface feedback immediately while IndexedDB snapshots a large File.
@@ -196,7 +271,7 @@ index 7f2db3d..17e8f0a 100644
          } catch {
            // Continue this live upload if persistent storage is unavailable; UI still reports progress.
          }
-@@ -509,9 +530,9 @@ export function useResumePendingUploads() {
+@@ -509,9 +581,9 @@ export function useResumePendingUploads() {
      const hydrateQueue = async () => {
        try {
          let tasks = await listUploadTasks();
@@ -208,7 +283,7 @@ index 7f2db3d..17e8f0a 100644
            for (const task of abandoned) {
              if (task.sessionId) await api.delete(`/uploads/${task.sessionId}`, { timeout: CONTROL_REQUEST_TIMEOUT_MS }).catch(() => {});
              await removeUploadTask(task.id).catch(() => {});
-@@ -527,7 +548,7 @@ export function useResumePendingUploads() {
+@@ -527,7 +599,7 @@ export function useResumePendingUploads() {
              : task.completedParts.reduce((sum, part) => sum + Math.min(task.partSize || 8 * 1024 * 1024, Math.max(0, task.file.size - (part - 1) * (task.partSize || 8 * 1024 * 1024))), 0);
            const progress = task.file.size ? Math.min(99, Math.round(bytesDone * 10000 / task.file.size) / 100) : 0;
            task.state = 'paused';
