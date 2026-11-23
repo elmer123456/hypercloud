@@ -16,6 +16,7 @@ on:
       - '.github/workflows/build-android.yml'
       - 'hypercloud-vault-startup-retry.patch'
       - 'hypercloud-low-cost.patch'
+      - 'hypercloud-large-upload.patch'
 
 
 
