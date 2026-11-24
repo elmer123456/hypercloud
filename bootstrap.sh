@@ -458,3 +458,11 @@ if [ -f hypercloud-large-upload.patch ]; then
   git apply --whitespace=nowarn hypercloud-large-upload.patch
   echo "Large upload responsiveness and cancellation fix applied"
 fi
+
+# Apply the Enterprise beta card and support contact to the web and Android build.
+if [ -f hypercloud-enterprise-beta.patch ]; then
+  git apply --check --whitespace=nowarn hypercloud-enterprise-beta.patch
+    git apply --whitespace=nowarn hypercloud-enterprise-beta.patch
+      echo "Enterprise beta and support contact applied"
+      fi
+      
