@@ -1,0 +1,101 @@
+--- a/frontend/src/pages/Plans.tsx
++++ b/frontend/src/pages/Plans.tsx
+@@ -5,7 +5,6 @@
+ import { api } from '../services/api';
+ 
+ const premiumUrl = String(import.meta.env.VITE_MP_PREMIUM_URL || 'https://mpago.la/27XFyhf').trim();
+-const enterpriseUrl = String(import.meta.env.VITE_MP_ENTERPRISE_URL || 'https://mpago.la/12wizvb').trim();
+ const atlosMerchantId = 'DDDZ46ELBA';
+ 
+ function openAtlosCheckout(planName: string, amount: number) {
+@@ -60,18 +59,19 @@
+   },
+   {
+     name: 'Enterprise',
+-    price: '$8.99',
+-    cadence: 'por mes',
+-    limit: 'Hasta 100 cuentas de nube',
+-    description: 'Más cuentas conectadas, respetando las cuotas de cada proveedor.',
++    price: 'Fase beta',
++    cadence: 'acceso por solicitud',
++    limit: 'Hasta 100 cuentas · sujeto a aprobación',
++    description: 'Estamos validando Enterprise. Consulta disponibilidad, condiciones y soporte técnico con nuestro equipo.',
+     features: [
+-      'Incluye todos los beneficios de Premium',
+-      'Hasta 100 cuentas de nube',
+-      'Archivos, proyectos y accesos en un mismo lugar',
++      'Incluye los beneficios de Premium',
++      'Hasta 100 cuentas de nube, sujeto a aprobación',
++      'Atención de ventas y soporte técnico durante la beta',
+     ],
+-    href: enterpriseUrl,
+-    action: 'Pagar con Mercado Pago',
++    href: 'mailto:hcloud.support@gmail.com?subject=Hypercloud%20Enterprise%20Beta&body=Hola%2C%20quisiera%20consultar%20el%20acceso%20beta%20de%20Enterprise.',
++    action: 'Contactar ventas y soporte',
+     featured: false,
++    beta: true,
+   },
+ ];
+ 
+@@ -84,6 +84,14 @@
+     );
+   }
+ 
++  if (planName === 'Enterprise') {
++    return (
++      <a href={href} aria-label="Contactar a ventas y soporte técnico de Hypercloud Enterprise" className="inline-flex min-h-12 w-full items-center justify-center gap-2 rounded-xl border border-sky-300/30 bg-sky-300/10 px-4 py-3 text-center font-bold text-sky-100 hover:bg-sky-300/20">
++        {action}<ArrowUpRight size={17} aria-hidden="true"/>
++      </a>
++    );
++  }
++
+   return (
+     <div className="grid w-full gap-2">
+       <a href={href} target="_blank" rel="noopener noreferrer" className="inline-flex min-h-12 w-full items-center justify-center gap-2 rounded-xl bg-emerald-300 px-4 py-3 font-bold text-slate-950 hover:bg-emerald-200">
+@@ -174,7 +182,7 @@
+             <article key={plan.name} className={`flex flex-col rounded-2xl border p-5 sm:p-6 ${plan.featured ? 'border-emerald-300/50 bg-emerald-300/[.07] shadow-[0_0_36px_rgba(110,231,183,.08)]' : 'border-white/10 bg-white/[.035]'}`}>
+               <div className="flex items-center justify-between gap-3">
+                 <h2 className="text-xl font-bold">{plan.name}</h2>
+-                {plan.featured && <span className="rounded-full bg-emerald-300/15 px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider text-emerald-200">Popular</span>}
++                {plan.featured ? <span className="rounded-full bg-emerald-300/15 px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider text-emerald-200">Popular</span> : plan.beta && <span className="rounded-full bg-sky-300/15 px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider text-sky-200">Fase beta</span>}
+               </div>
+               <p className="mt-4 flex items-baseline gap-2">
+                 <span className="text-3xl font-black tracking-tight">{plan.price}</span>
+@@ -197,7 +205,7 @@
+ 
+         <aside className="mx-auto mt-6 max-w-4xl rounded-xl border border-white/10 bg-white/[.03] p-4 text-xs leading-5 text-white/60 sm:p-5 sm:text-sm">
+           <p className="flex gap-2"><Cloud size={17} className="mt-0.5 shrink-0 text-emerald-200" aria-hidden="true"/>
+-            Mercado Pago conserva sus enlaces actuales. ATLOS acepta pagos cripto internacionales con suscripción mensual en USD; la recurrencia la administra ATLOS. Hypercloud verifica manualmente el pago y asigna el plan; las cuotas y condiciones de cada proveedor siguen aplicando, y el espacio se agrega solo dentro de tu cuenta, no se comparte entre usuarios.
++            Mercado Pago y ATLOS están disponibles para Premium; los pagos y la asignación del plan se verifican manualmente. Enterprise está en fase beta y no tiene checkout automático: el botón abre un correo a hcloud.support@gmail.com para solicitar acceso y consultar con ventas y soporte técnico. Las cuotas de cada proveedor siguen aplicando; el espacio se agrega solo dentro de tu cuenta, no se comparte entre usuarios.
+           </p>
+         </aside>
+       </div>
+--- a/frontend/src/pages/Legal.tsx
++++ b/frontend/src/pages/Legal.tsx
+@@ -1,6 +1,6 @@
+ import {Link} from 'react-router-dom';
+ import { BrandMark } from '../components/BrandMark';
+-const CONTACT='fforlife456@gmail.com',UPDATED='19 de octubre de 2026';
++const CONTACT='hcloud.support@gmail.com',UPDATED='23 de noviembre de 2026';
+ const H=({children}:{children:any})=><h2 className="mt-6 text-lg font-bold text-vault-primary">{children}</h2>;
+ export function Legal({kind}:{kind:'privacy'|'terms'}){return <main className="mx-auto max-w-3xl p-6 leading-relaxed text-sm text-white/85">
+  <Link to="/" className="inline-flex items-center gap-3 text-2xl font-black text-vault-primary"><BrandMark className="h-11 w-11 rounded-xl"/>HYPERCLOUD</Link>
+@@ -11,14 +11,15 @@
+   <H>Datos de usuario de Google</H><p>Si conectas Google Drive, la app solicita los permisos <code>drive</code>, <code>email</code> y <code>openid</code> únicamente para: listar tus archivos y carpetas de Drive, mostrar miniaturas, reproducir/descargar archivos, subir archivos, crear y renombrar carpetas y mover a la papelera los elementos que tú elijas, además de mostrar qué cuenta de Google está conectada y su espacio disponible.</p>
+   <p className="mt-2">El uso y la transferencia de la información recibida de las API de Google a cualquier otra aplicación se ajustará a la <a className="underline" href="https://developers.google.com/terms/api-services-user-data-policy" target="_blank" rel="noreferrer">Política de datos de usuario de los servicios de API de Google</a>, incluidos los requisitos de Uso limitado. No vendemos datos, no los usamos para publicidad ni para entrenar modelos de IA, y no los compartimos con terceros. Las personas no leen tus datos salvo que tú lo pidas para soporte, por seguridad o por obligación legal.</p>
+   <p className="mt-2 text-vault-muted"><i>English summary: Hypercloud's use and transfer of information received from Google APIs adheres to the Google API Services User Data Policy, including the Limited Use requirements. Google Drive data is only used to provide the file-manager features the user requests; it is never sold, used for advertising, used to train AI models, or shared with third parties.</i></p>
+-  <H>Conservación y eliminación</H><p>Al desconectar una nube se eliminan sus credenciales y metadatos de nuestra base de datos (tus archivos siguen en tu nube). Puedes revocar el acceso de Google en cualquier momento en <a className="underline" href="https://myaccount.google.com/permissions" target="_blank" rel="noreferrer">myaccount.google.com/permissions</a>. Para borrar tu cuenta de Hypercloud escribe a {CONTACT}.</p>
++  <H>Conservación y eliminación</H><p>Al desconectar una nube se eliminan sus credenciales y metadatos de nuestra base de datos (tus archivos siguen en tu nube). Puedes revocar el acceso de Google en cualquier momento en <a className="underline" href="https://myaccount.google.com/permissions" target="_blank" rel="noreferrer">myaccount.google.com/permissions</a>. Para borrar tu cuenta de Hypercloud escribe a <a className="underline" href={`mailto:${CONTACT}?subject=Eliminar%20cuenta%20Hypercloud`}>{CONTACT}</a>.</p>
+   <H>Seguridad</H><p>Conexiones HTTPS y aislamiento por usuario. Las credenciales de nubes conectadas se cifran en el servidor con AES‑256‑GCM. Los secretos de Accesos y 2FA se cifran en el navegador con una clave aleatoria protegida por el servidor y se descifran en el dispositivo después de verificar el PIN. Por ello, el PIN protege el acceso, pero no constituye cifrado de extremo a extremo: el servicio puede descifrar la bóveda tras la verificación. Usa un PIN único y protege tu cuenta y dispositivo. El PIN se limita temporalmente tras varios intentos fallidos. Protege también tu dispositivo y mantén el navegador actualizado.</p>
+-  <H>Contacto</H><p>{CONTACT}</p></>:<>
++  <H>Contacto</H><p><a className="underline" href={`mailto:${CONTACT}`}>{CONTACT}</a></p></>:<>
+   <h1 className="mt-4 text-2xl font-bold">Términos del servicio</h1><p className="text-vault-muted">Última actualización: {UPDATED}</p>
+   <p className="mt-4">Al usar Hypercloud aceptas estos términos.</p>
+   <H>El servicio</H><p>Hypercloud es un gestor que une cuentas de almacenamiento que ya te pertenecen. No ofrece almacenamiento propio: tus archivos permanecen en cada proveedor (Drime, Google Drive, MEGA, pCloud).</p>
+   <H>Tus responsabilidades</H><ul className="ml-5 list-disc"><li>Solo conecta cuentas de tu propiedad o que estés autorizado a usar.</li><li>Cumple los términos de cada proveedor de nube (algunos limitan el número de cuentas gratuitas por persona).</li><li>No uses la app para contenido ilegal o que infrinja derechos de terceros.</li></ul>
+   <H>Disponibilidad</H><p>El servicio se ofrece «tal cual», sin garantías. Haz copias de seguridad de lo importante. Podemos suspender cuentas que abusen del servicio.</p>
++  <H>Planes y fase beta</H><p>Enterprise está en fase beta. El acceso es limitado y sujeto a disponibilidad; las funciones y condiciones comerciales se confirmarán antes de contratar. Para consultar con ventas y soporte técnico, escribe a <a className="underline" href={`mailto:${CONTACT}?subject=Hypercloud%20Enterprise%20Beta`}>{CONTACT}</a>.</p>
+   <H>Privacidad</H><p>Consulta la <Link className="underline" to="/privacy">Política de privacidad</Link>.</p>
+-  <H>Contacto</H><p>{CONTACT}</p></>}
++  <H>Contacto</H><p><a className="underline" href={`mailto:${CONTACT}`}>{CONTACT}</a></p></>}
+  </main>;}
